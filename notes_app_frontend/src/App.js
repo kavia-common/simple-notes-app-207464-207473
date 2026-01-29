@@ -18,6 +18,14 @@ import {
   getNoteSnapshots,
   clearNoteSnapshots,
 } from "./utils/versionHistory";
+import {
+  canUseEncryptedStorage,
+  createEncryptedVaultFromLegacy,
+  hasEncryptedPayload,
+  hasLegacyUnencryptedNotes,
+  saveEncryptedNotes,
+  unlockEncryptedNotes,
+} from "./utils/encryptedStorage";
 import "./App.css";
 
 /**
@@ -28,8 +36,11 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+// Legacy keys kept for backwards-compatibility migration only.
+// New encrypted storage uses utils/encryptedStorage.js
 const STORAGE_KEY = "retro_notes_v1";
 const TRASH_STORAGE_KEY = "retro_notes_trash_v1";
+
 const SORT_MODE_KEY = "retro_notes_sort_mode_v1";
 const EXPORT_SCHEMA_VERSION = 2;
 
@@ -329,6 +340,14 @@ function App() {
 
   const [error, setError] = useState("");
 
+  // Encryption / lock state
+  const encryptionSupported = useMemo(() => canUseEncryptedStorage(), []);
+  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [passphrase, setPassphrase] = useState("");
+  const [passphraseDraft, setPassphraseDraft] = useState("");
+  const [unlockError, setUnlockError] = useState("");
+  const [unlockBusy, setUnlockBusy] = useState(false);
+
   // Notifications permission state (for UI display).
   const [notifPermission, setNotifPermission] = useState(() =>
     getNotificationPermission()
@@ -397,6 +416,89 @@ function App() {
     }, 0);
   }
 
+  // PUBLIC_INTERFACE
+  async function lockNow() {
+    /** Immediately lock the app (keeps encrypted payload in localStorage). */
+    // Best-effort: persist any in-memory changes before locking.
+    try {
+      if (passphrase) {
+        await saveEncryptedNotes(passphrase, { activeNotes: notes, trashedNotes });
+      }
+    } catch (e) {
+      console.warn("Failed to save before lock:", e);
+    }
+
+    // Clear sensitive state from memory.
+    setIsUnlocked(false);
+    setPassphrase("");
+    setPassphraseDraft("");
+    setUnlockError("");
+    setQuery("");
+    setActiveTag("");
+    setSelectedId(null);
+    setTitle("");
+    setBody("");
+    setNotes([]);
+    setTrashedNotes([]);
+    setIsHistoryOpen(false);
+    setHistoryItems([]);
+    setView("notes");
+  }
+
+  async function doUnlock(phrase) {
+    setUnlockBusy(true);
+    setUnlockError("");
+    setError("");
+
+    try {
+      const existsEnc = hasEncryptedPayload();
+      const hasLegacy = hasLegacyUnencryptedNotes();
+
+      let payload;
+      if (!existsEnc && hasLegacy) {
+        // Migration path: create encrypted vault from legacy plaintext.
+        payload = await createEncryptedVaultFromLegacy(phrase);
+      } else {
+        payload = await unlockEncryptedNotes(phrase);
+      }
+
+      const normalizedActive = (payload.activeNotes || [])
+        .map((n) => normalizeNote(n))
+        .filter(Boolean)
+        .map((n) => ({ ...n, deletedAt: undefined }))
+        .sort(sortNotesPinnedFirst);
+
+      const normalizedTrash = (payload.trashedNotes || [])
+        .map((n) => normalizeNote(n))
+        .filter(Boolean)
+        .map((n) => ({
+          ...n,
+          deletedAt: Number.isFinite(n.deletedAt) ? n.deletedAt : Date.now(),
+          pinned: false,
+        }))
+        .sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
+
+      setNotes(normalizedActive);
+      setTrashedNotes(normalizedTrash);
+
+      setSelectedId(normalizedActive[0]?.id || null);
+      setView("notes");
+
+      setPassphrase(phrase);
+      setPassphraseDraft("");
+      setIsUnlocked(true);
+
+      setAutosaveStatus("saved");
+      setAutosaveMessage("All changes saved");
+      setLastAutosavedAt(0);
+    } catch (e) {
+      console.error("Unlock failed:", e);
+      setUnlockError("Incorrect passphrase or corrupted vault.");
+    } finally {
+      setUnlockBusy(false);
+    }
+  }
+
   // Persist theme preference.
   useEffect(() => {
     try {
@@ -416,79 +518,36 @@ function App() {
     meta.setAttribute("content", theme === "light" ? "#f8fafc" : "#070812");
   }, [theme]);
 
-  // Load from localStorage once.
+  // Load from localStorage once:
+  // - sort mode is always readable
+  // - notes are now encrypted; user must unlock to load them
   useEffect(() => {
     try {
-      // Load sort mode (keep independent from notes payload for compatibility).
       const storedSort = localStorage.getItem(SORT_MODE_KEY);
       if (storedSort && SORT_MODES.some((m) => m.value === storedSort)) {
         setSortMode(storedSort);
       }
-
-      // Active notes (legacy key).
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          const normalized = parsed
-            .map((n) => normalizeNote(n))
-            .filter(Boolean)
-            .map((n) => ({ ...n, deletedAt: undefined })) // ensure active notes are not "deleted"
-            .sort(sortNotesPinnedFirst);
-
-          setNotes(normalized);
-          if (normalized.length > 0) {
-            setSelectedId(normalized[0].id);
-          }
-        }
-      }
-
-      // Trashed notes (new key).
-      const trashRaw = localStorage.getItem(TRASH_STORAGE_KEY);
-      if (trashRaw) {
-        const parsedTrash = JSON.parse(trashRaw);
-        if (Array.isArray(parsedTrash)) {
-          const normalizedTrash = parsedTrash
-            .map((n) => normalizeNote(n))
-            .filter(Boolean)
-            .map((n) => ({
-              ...n,
-              deletedAt: Number.isFinite(n.deletedAt) ? n.deletedAt : Date.now(),
-              pinned: false, // pinned doesn't matter in trash; keep it simple
-            }))
-            .sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
-
-          setTrashedNotes(normalizedTrash);
-        }
-      }
     } catch (e) {
-      // Corrupted storage should not brick the UI.
-      console.error("Failed to load notes from storage:", e);
-      setError("Could not load saved notes (storage looked corrupted).");
+      console.warn("Failed to read sort mode:", e);
     }
   }, []);
 
-  // Persist whenever active notes change.
+  // Persist whenever active notes / trash change (encrypted).
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
-    } catch (e) {
-      console.error("Failed to persist notes:", e);
-      setError("Storage is full or unavailable. Changes may not persist.");
-      setAutosaveStatus("error");
-      setAutosaveMessage("Storage error");
-    }
-  }, [notes]);
+    if (!isUnlocked) return;
+    if (!passphrase) return;
 
-  // Persist whenever trash changes.
-  useEffect(() => {
-    try {
-      localStorage.setItem(TRASH_STORAGE_KEY, JSON.stringify(trashedNotes));
-    } catch (e) {
-      console.error("Failed to persist trash:", e);
-      setError("Storage is full or unavailable. Changes may not persist.");
-    }
-  }, [trashedNotes]);
+    (async () => {
+      try {
+        await saveEncryptedNotes(passphrase, { activeNotes: notes, trashedNotes });
+      } catch (e) {
+        console.error("Failed to persist encrypted notes:", e);
+        setError("Storage is full or unavailable. Changes may not persist.");
+        setAutosaveStatus("error");
+        setAutosaveMessage("Storage error");
+      }
+    })();
+  }, [notes, trashedNotes, isUnlocked, passphrase]);
 
   // Persist sort preference.
   useEffect(() => {
@@ -671,6 +730,8 @@ function App() {
 
   // PUBLIC_INTERFACE
   function createNewNote() {
+    if (!isUnlocked) return;
+
     setError("");
     const now = Date.now();
     const newNote = {
@@ -728,6 +789,7 @@ function App() {
 
   // Autosave: mark as dirty on draft changes and schedule a debounced save.
   useEffect(() => {
+    if (!isUnlocked) return;
     if (view !== "notes") return;
     if (!activeSelectedNote) return;
 
@@ -772,7 +834,7 @@ function App() {
       const nextTitle = trimmedTitle || "Untitled";
 
       try {
-        // 1) Update note in state (persisted via existing notes effect).
+        // 1) Update note in state (persisted via encrypted persistence effect).
         setNotes((prev) => {
           const updated = prev.map((n) =>
             n.id === activeSelectedNote.id
@@ -822,11 +884,16 @@ function App() {
       }
     };
     // Intentionally depends on draft fields + selected note identity.
-  }, [title, body, view, activeSelectedNote, isHistoryOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [title, body, view, activeSelectedNote, isHistoryOpen, isUnlocked]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // PUBLIC_INTERFACE
   function saveSelectedNote() {
     setError("");
+
+    if (!isUnlocked) {
+      setError("Unlock to edit notes.");
+      return;
+    }
 
     if (view !== "notes") {
       setError("Trash items can't be edited. Restore the note first.");
@@ -886,6 +953,10 @@ function App() {
   function moveSelectedNoteToTrash() {
     /** Soft delete: remove from active list and move into Trash. */
     setError("");
+    if (!isUnlocked) {
+      setError("Unlock to delete notes.");
+      return;
+    }
     if (view !== "notes") {
       setError("Switch to Notes to delete notes.");
       return;
@@ -934,6 +1005,10 @@ function App() {
   function restoreSelectedNoteFromTrash() {
     /** Restore: move from Trash back to Notes. */
     setError("");
+    if (!isUnlocked) {
+      setError("Unlock to restore notes.");
+      return;
+    }
     if (view !== "trash") {
       setError("Switch to Trash to restore notes.");
       return;
@@ -967,6 +1042,10 @@ function App() {
   function permanentlyDeleteSelectedTrashNote() {
     /** Permanent delete: remove from Trash forever. */
     setError("");
+    if (!isUnlocked) {
+      setError("Unlock to delete notes.");
+      return;
+    }
     if (view !== "trash") {
       setError("Switch to Trash to permanently delete notes.");
       return;
@@ -994,6 +1073,10 @@ function App() {
   function emptyTrash() {
     /** Permanently delete ALL notes from Trash. */
     setError("");
+    if (!isUnlocked) {
+      setError("Unlock to empty Trash.");
+      return;
+    }
     if (trashedNotes.length === 0) return;
 
     const ok = window.confirm(
@@ -1033,6 +1116,11 @@ function App() {
     /** Schedule a reminder for the selected note (Notes view only). */
     setError("");
 
+    if (!isUnlocked) {
+      setError("Unlock to set reminders.");
+      return;
+    }
+
     if (view !== "notes") {
       setError("Set reminders from Notes (Trash is read-only).");
       return;
@@ -1067,6 +1155,7 @@ function App() {
     /** Cancel reminder for selected note. */
     setError("");
 
+    if (!isUnlocked) return;
     if (view !== "notes") return;
     if (!activeSelectedNote) return;
 
@@ -1084,6 +1173,7 @@ function App() {
   // PUBLIC_INTERFACE
   function togglePin(noteId) {
     /** Toggle pin/unpin for a note. */
+    if (!isUnlocked) return;
     if (view !== "notes") return;
 
     setNotes((prev) => {
@@ -1099,6 +1189,11 @@ function App() {
   function addTagsToSelectedNote(rawInput) {
     /** Add one or more tags to the selected note. Accepts comma-separated input. */
     setError("");
+
+    if (!isUnlocked) {
+      setError("Unlock to edit tags.");
+      return;
+    }
 
     if (view !== "notes") {
       setError("Trash items can't be tagged. Restore the note first.");
@@ -1132,6 +1227,11 @@ function App() {
   function removeTagFromSelectedNote(tagToRemove) {
     /** Remove a tag from the selected note. */
     setError("");
+
+    if (!isUnlocked) {
+      setError("Unlock to edit tags.");
+      return;
+    }
 
     if (view !== "notes") {
       setError("Trash items can't be edited. Restore the note first.");
@@ -1167,6 +1267,8 @@ function App() {
   // PUBLIC_INTERFACE
   function renameTagGlobally(fromTag, toTag) {
     /** Rename a tag across all active notes. If toTag exists, this effectively merges them. */
+    if (!isUnlocked) return { ok: false, message: "Unlock to edit tags." };
+
     const from = normalizeTag(fromTag);
     const to = normalizeTag(toTag);
 
@@ -1198,6 +1300,8 @@ function App() {
   // PUBLIC_INTERFACE
   function mergeTagsGlobally(fromTags, toTag) {
     /** Merge one or more tags into a single tag across all active notes. */
+    if (!isUnlocked) return { ok: false, message: "Unlock to edit tags." };
+
     const to = normalizeTag(toTag);
     const fromList = Array.isArray(fromTags)
       ? Array.from(new Set(fromTags.map(normalizeTag).filter(Boolean)))
@@ -1239,6 +1343,8 @@ function App() {
   // PUBLIC_INTERFACE
   function deleteTagGlobally(tag) {
     /** Delete a tag across all active notes. */
+    if (!isUnlocked) return { ok: false, message: "Unlock to edit tags." };
+
     const t = normalizeTag(tag);
     if (!t) return { ok: false, message: "Tag is required." };
 
@@ -1277,6 +1383,11 @@ function App() {
     /** Download notes as a JSON file (includes pinned state + tags + trash). */
     setError("");
 
+    if (!isUnlocked) {
+      setError("Unlock to export notes.");
+      return;
+    }
+
     try {
       const payload = {
         schemaVersion: EXPORT_SCHEMA_VERSION,
@@ -1309,6 +1420,11 @@ function App() {
   async function importNotesFromJsonFile(file) {
     /** Import notes from a JSON file. Merges by id to avoid duplicates. */
     setError("");
+
+    if (!isUnlocked) {
+      setError("Unlock to import notes.");
+      return;
+    }
 
     if (!file) return;
 
@@ -1423,6 +1539,7 @@ function App() {
       // Always allow browser/system shortcuts like reload, devtools, etc.
       // We only preventDefault when we actually handle something.
       if (metaOrCtrl && lower === "n" && !ignore) {
+        if (!isUnlocked) return;
         e.preventDefault();
         createNewNote();
         return;
@@ -1430,6 +1547,7 @@ function App() {
 
       // Focus search: Ctrl/Cmd+F or "/" when not typing.
       if (((metaOrCtrl && lower === "f") || (!metaOrCtrl && lower === "/")) && !ignore) {
+        if (!isUnlocked) return;
         e.preventDefault();
         focusSearch();
         return;
@@ -1437,6 +1555,7 @@ function App() {
 
       // Toggle views
       if (metaOrCtrl && (lower === "1" || lower === "2") && !ignore) {
+        if (!isUnlocked) return;
         e.preventDefault();
         setView(lower === "1" ? "notes" : "trash");
         return;
@@ -1444,6 +1563,7 @@ function App() {
 
       // Toggle Markdown Edit/Preview in Notes view
       if (metaOrCtrl && lower === "p" && !ignore) {
+        if (!isUnlocked) return;
         if (view !== "notes") return;
         if (!activeSelectedNote) return;
         e.preventDefault();
@@ -1453,6 +1573,7 @@ function App() {
 
       // Tag Manager: Ctrl/Cmd+T (Notes view)
       if (metaOrCtrl && lower === "t" && !ignore) {
+        if (!isUnlocked) return;
         if (view !== "notes") return;
         e.preventDefault();
         openTagManager();
@@ -1461,6 +1582,8 @@ function App() {
 
       // Delete shortcut when NOT typing
       if ((key === "Delete" || key === "Backspace") && !ignore) {
+        if (!isUnlocked) return;
+
         // In Notes: delete -> move to trash
         if (view === "notes") {
           if (!activeSelectedNote) return;
@@ -1480,6 +1603,7 @@ function App() {
 
       // Restore in trash (R)
       if (view === "trash" && lower === "r" && !ignore) {
+        if (!isUnlocked) return;
         if (!trashSelectedNote) return;
         e.preventDefault();
         restoreSelectedNoteFromTrash();
@@ -1516,6 +1640,7 @@ function App() {
     isTagManagerOpen,
     activeSelectedNote,
     trashSelectedNote,
+    isUnlocked,
     // actions
     createNewNote,
     openTagManager,
@@ -1569,10 +1694,28 @@ function App() {
 
     return [
       {
+        id: "lock",
+        label: isUnlocked ? "Lock (encrypted notes)" : "Unlock (encrypted notes)",
+        hint: "Toggle",
+        keywords: ["lock", "unlock", "encryption", "secure", "vault"],
+        run: () => {
+          if (isUnlocked) lockNow();
+          else {
+            // Focus stays in unlock panel; command palette just closes.
+            setTimeout(() => {
+              const el = document.getElementById("vault-passphrase");
+              el?.focus?.();
+            }, 0);
+          }
+        },
+      },
+      {
         id: "new-note",
         label: "New note",
         hint: "Ctrl/⌘+N",
         keywords: ["create", "add", "note"],
+        disabled: !isUnlocked,
+        disabledReason: !isUnlocked ? "Unlock first" : "",
         run: () => createNewNote(),
       },
       {
@@ -1580,6 +1723,8 @@ function App() {
         label: "Focus search",
         hint: "Ctrl/⌘+F or /",
         keywords: ["find", "filter", "search"],
+        disabled: !isUnlocked,
+        disabledReason: !isUnlocked ? "Unlock first" : "",
         run: () => focusSearch(),
       },
       {
@@ -1587,6 +1732,8 @@ function App() {
         label: toggleViewLabel,
         hint: toggleViewHint,
         keywords: ["notes", "trash", "view", "switch"],
+        disabled: !isUnlocked,
+        disabledReason: !isUnlocked ? "Unlock first" : "",
         run: () => setView(view === "trash" ? "notes" : "trash"),
       },
       {
@@ -1594,8 +1741,8 @@ function App() {
         label: "Export notes (JSON)",
         hint: "Download",
         keywords: ["backup", "download", "json"],
-        disabled: !hasAnyNotes,
-        disabledReason: !hasAnyNotes ? "No notes to export" : "",
+        disabled: !isUnlocked || !hasAnyNotes,
+        disabledReason: !isUnlocked ? "Unlock first" : !hasAnyNotes ? "No notes to export" : "",
         run: () => exportNotesToJson(),
       },
       {
@@ -1603,6 +1750,8 @@ function App() {
         label: "Import notes (JSON)",
         hint: "File…",
         keywords: ["restore", "upload", "json"],
+        disabled: !isUnlocked,
+        disabledReason: !isUnlocked ? "Unlock first" : "",
         run: () => importInputRef.current?.click(),
       },
       {
@@ -1617,9 +1766,10 @@ function App() {
         label: "Tags: Open Tag Manager",
         hint: "Ctrl/⌘+T",
         keywords: ["tag", "tags", "rename", "merge", "delete"],
-        disabled: view !== "notes" || tagStats.length === 0,
-        disabledReason:
-          view !== "notes"
+        disabled: !isUnlocked || view !== "notes" || tagStats.length === 0,
+        disabledReason: !isUnlocked
+          ? "Unlock first"
+          : view !== "notes"
             ? "Only available in Notes"
             : tagStats.length === 0
               ? "No tags yet"
@@ -1631,9 +1781,10 @@ function App() {
         label: toggleMdLabel,
         hint: "Ctrl/⌘+P",
         keywords: ["preview", "edit", "markdown"],
-        disabled: view !== "notes" || !hasSelectedNote,
-        disabledReason:
-          view !== "notes"
+        disabled: !isUnlocked || view !== "notes" || !hasSelectedNote,
+        disabledReason: !isUnlocked
+          ? "Unlock first"
+          : view !== "notes"
             ? "Only available in Notes"
             : !hasSelectedNote
               ? "No note selected"
@@ -1645,14 +1796,16 @@ function App() {
         label: isHistoryOpen ? "History: Hide versions" : "History: Show versions",
         hint: "Toggle",
         keywords: ["history", "versions", "snapshot", "restore"],
-        disabled: view !== "notes" || !hasSelectedNote,
-        disabledReason:
-          view !== "notes"
+        disabled: !isUnlocked || view !== "notes" || !hasSelectedNote,
+        disabledReason: !isUnlocked
+          ? "Unlock first"
+          : view !== "notes"
             ? "Only available in Notes"
             : !hasSelectedNote
               ? "No note selected"
               : "",
         run: () => {
+          if (!isUnlocked) return;
           if (view !== "notes" || !activeSelectedNote) return;
           setIsHistoryOpen((v) => !v);
           setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
@@ -1663,9 +1816,14 @@ function App() {
         label: "History: Restore latest snapshot",
         hint: "Restore",
         keywords: ["history", "restore", "undo"],
-        disabled: view !== "notes" || !hasSelectedNote || getNoteSnapshots(activeSelectedNote?.id).length === 0,
-        disabledReason:
-          view !== "notes"
+        disabled:
+          !isUnlocked ||
+          view !== "notes" ||
+          !hasSelectedNote ||
+          getNoteSnapshots(activeSelectedNote?.id).length === 0,
+        disabledReason: !isUnlocked
+          ? "Unlock first"
+          : view !== "notes"
             ? "Only available in Notes"
             : !hasSelectedNote
               ? "No note selected"
@@ -1673,6 +1831,7 @@ function App() {
                 ? "No snapshots yet"
                 : "",
         run: () => {
+          if (!isUnlocked) return;
           if (view !== "notes" || !activeSelectedNote) return;
           const snaps = getNoteSnapshots(activeSelectedNote.id);
           const latest = snaps[0];
@@ -1698,14 +1857,13 @@ function App() {
     trashSelectedNote,
     isHistoryOpen,
     tagStats.length,
+    isUnlocked,
     // actions + refs
     createNewNote,
     exportNotesToJson,
     toggleTheme,
     openTagManager,
-    restoreSelectedNoteFromTrash,
-    permanentlyDeleteSelectedTrashNote,
-    moveSelectedNoteToTrash,
+    lockNow,
     importInputRef,
   ]);
 
@@ -1739,7 +1897,7 @@ function App() {
             <p className="retro-subtitle">
               Add, edit, delete — all offline.{" "}
               <span className="retro-viewhint" aria-hidden="true">
-                • {view === "trash" ? "TRASH" : "NOTES"}
+                • {isUnlocked ? (view === "trash" ? "TRASH" : "NOTES") : "LOCKED"}
               </span>
             </p>
           </div>
@@ -1772,6 +1930,29 @@ function App() {
             </button>
           </div>
 
+          <div className="retro-lockchip" role="group" aria-label="Encryption">
+            <span className="retro-lockchip__label" aria-hidden="true">
+              Vault
+            </span>
+            <span className={`retro-lockchip__pill ${isUnlocked ? "is-unlocked" : "is-locked"}`}>
+              {isUnlocked ? "Unlocked" : "Locked"}
+            </span>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={() => {
+                if (isUnlocked) lockNow();
+                else {
+                  const el = document.getElementById("vault-passphrase");
+                  el?.focus?.();
+                }
+              }}
+              title={isUnlocked ? "Lock notes" : "Unlock notes"}
+            >
+              {isUnlocked ? "Lock" : "Unlock"}
+            </button>
+          </div>
+
           <div className="retro-viewtoggle" role="group" aria-label="Notes view">
             <button
               type="button"
@@ -1779,6 +1960,7 @@ function App() {
               onClick={() => setView("notes")}
               aria-pressed={view === "notes" ? "true" : "false"}
               title="Show notes"
+              disabled={!isUnlocked}
             >
               Notes ({notes.length})
             </button>
@@ -1788,6 +1970,7 @@ function App() {
               onClick={() => setView("trash")}
               aria-pressed={view === "trash" ? "true" : "false"}
               title="Show trash"
+              disabled={!isUnlocked}
             >
               Trash ({trashedNotes.length})
             </button>
@@ -1797,7 +1980,8 @@ function App() {
             type="button"
             className="btn"
             onClick={() => importInputRef.current?.click()}
-            title="Import notes from JSON"
+            title={isUnlocked ? "Import notes from JSON" : "Unlock to import"}
+            disabled={!isUnlocked}
           >
             Import
           </button>
@@ -1806,11 +1990,13 @@ function App() {
             type="button"
             className="btn"
             onClick={exportNotesToJson}
-            disabled={notes.length === 0 && trashedNotes.length === 0}
+            disabled={!isUnlocked || (notes.length === 0 && trashedNotes.length === 0)}
             title={
-              notes.length === 0 && trashedNotes.length === 0
-                ? "No notes to export"
-                : "Export notes to JSON"
+              !isUnlocked
+                ? "Unlock to export"
+                : notes.length === 0 && trashedNotes.length === 0
+                  ? "No notes to export"
+                  : "Export notes to JSON"
             }
           >
             Export
@@ -1820,815 +2006,913 @@ function App() {
             type="button"
             className="btn"
             onClick={openTagManager}
-            disabled={view !== "notes" || tagStats.length === 0}
+            disabled={!isUnlocked || view !== "notes" || tagStats.length === 0}
             title={
-              view !== "notes"
-                ? "Tag Manager is available in Notes view"
-                : tagStats.length === 0
-                  ? "No tags yet"
-                  : "Manage tags (rename, merge, delete)"
+              !isUnlocked
+                ? "Unlock to manage tags"
+                : view !== "notes"
+                  ? "Tag Manager is available in Notes view"
+                  : tagStats.length === 0
+                    ? "No tags yet"
+                    : "Manage tags (rename, merge, delete)"
             }
           >
             Tags
           </button>
 
-          <button className="btn btn-primary" onClick={createNewNote}>
+          <button className="btn btn-primary" onClick={createNewNote} disabled={!isUnlocked}>
             + New note
           </button>
         </div>
       </header>
 
-      <main className="retro-main">
-        <aside className="retro-sidebar" aria-label="Notes list">
-          <div className="retro-panel">
-            <label className="retro-label" htmlFor="search">
-              Search
-            </label>
-
-            <div className="retro-search">
-              <input
-                ref={searchInputRef}
-                id="search"
-                className="retro-input retro-search__input"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") setQuery("");
-                }}
-                placeholder={view === "trash" ? "Search trash…" : "Type to filter…"}
-                aria-describedby="search-help"
-              />
-              <button
-                type="button"
-                className="btn retro-search__clear"
-                onClick={() => setQuery("")}
-                disabled={!query.trim()}
-                title="Clear search"
-              >
-                Clear
-              </button>
+      {!encryptionSupported ? (
+        <main className="retro-main">
+          <section className="retro-editor" aria-label="Encryption unsupported">
+            <div className="retro-editor__toolbar">
+              <div className="retro-toolbar__left">
+                <span className="retro-status">
+                  <strong className="retro-status__strong">Encryption not supported</strong>
+                </span>
+              </div>
+            </div>
+            <div className="retro-placeholder" role="status">
+              <div className="retro-placeholder__title">This browser can't encrypt notes.</div>
+              <div className="retro-placeholder__body">
+                Your environment does not support WebCrypto (AES-GCM). Try a modern browser.
+              </div>
+            </div>
+          </section>
+        </main>
+      ) : !isUnlocked ? (
+        <main className="retro-main">
+          <section className="retro-editor" aria-label="Unlock encrypted notes">
+            <div className="retro-editor__toolbar">
+              <div className="retro-toolbar__left">
+                <span className="retro-status">
+                  <strong className="retro-status__strong">Locked</strong>{" "}
+                  <span className="retro-status__sub">Enter passphrase to unlock your local vault.</span>
+                </span>
+              </div>
+              <div className="retro-toolbar__right">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => openCommandPalette()}
+                  title="Open command palette"
+                >
+                  Palette
+                </button>
+              </div>
             </div>
 
-            {view === "notes" ? (
-              <div className="retro-sortbar" aria-label="Sorting options">
-                <label className="retro-label" htmlFor="sort">
-                  Sort
-                </label>
-                <select
-                  id="sort"
-                  className="retro-input retro-select"
-                  value={sortMode}
-                  onChange={(e) => setSortMode(e.target.value)}
-                  aria-label="Sort notes"
-                >
-                  {SORT_MODES.map((m) => (
-                    <option key={m.value} value={m.value}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
+            {unlockError ? (
+              <div className="retro-alert" role="alert">
+                {unlockError}
               </div>
             ) : null}
 
-            {view === "notes" ? (
-              <div className="retro-filterbar" aria-label="Tag filters">
-                <div className="retro-filterbar__row">
-                  <span className="retro-filterbar__label">Tags</span>
-                  <button
-                    type="button"
-                    className="btn retro-filterbar__clear"
-                    onClick={() => setActiveTag("")}
-                    disabled={!normalizeTag(activeTag)}
-                    title="Clear tag filter"
+            <div className="retro-editor__form">
+              <div className="retro-field">
+                <label className="retro-label" htmlFor="vault-passphrase">
+                  Passphrase
+                </label>
+                <input
+                  id="vault-passphrase"
+                  type="password"
+                  className="retro-input"
+                  value={passphraseDraft}
+                  onChange={(e) => setPassphraseDraft(e.target.value)}
+                  placeholder="Type your passphrase…"
+                  autoComplete="current-password"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (!passphraseDraft.trim()) return;
+                      doUnlock(passphraseDraft);
+                    }
+                  }}
+                />
+                <div className="retro-hint retro-hint--small">
+                  Notes are encrypted locally. If you forget the passphrase, the vault cannot be recovered.
+                </div>
+              </div>
+
+              <div className="retro-lock-actions">
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => doUnlock(passphraseDraft)}
+                  disabled={!passphraseDraft.trim() || unlockBusy}
+                  title="Unlock notes"
+                >
+                  {unlockBusy ? "Unlocking…" : "Unlock"}
+                </button>
+
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setPassphraseDraft("")}
+                  disabled={!passphraseDraft || unlockBusy}
+                  title="Clear"
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="retro-lock-meta">
+                <div>
+                  Encrypted vault: <strong>{hasEncryptedPayload() ? "present" : "not created"}</strong>
+                </div>
+                <div>
+                  Legacy notes: <strong>{hasLegacyUnencryptedNotes() ? "found" : "none"}</strong>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+      ) : (
+        <main className="retro-main">
+          <aside className="retro-sidebar" aria-label="Notes list">
+            <div className="retro-panel">
+              <label className="retro-label" htmlFor="search">
+                Search
+              </label>
+
+              <div className="retro-search">
+                <input
+                  ref={searchInputRef}
+                  id="search"
+                  className="retro-input retro-search__input"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setQuery("");
+                  }}
+                  placeholder={view === "trash" ? "Search trash…" : "Type to filter…"}
+                  aria-describedby="search-help"
+                />
+                <button
+                  type="button"
+                  className="btn retro-search__clear"
+                  onClick={() => setQuery("")}
+                  disabled={!query.trim()}
+                  title="Clear search"
+                >
+                  Clear
+                </button>
+              </div>
+
+              {view === "notes" ? (
+                <div className="retro-sortbar" aria-label="Sorting options">
+                  <label className="retro-label" htmlFor="sort">
+                    Sort
+                  </label>
+                  <select
+                    id="sort"
+                    className="retro-input retro-select"
+                    value={sortMode}
+                    onChange={(e) => setSortMode(e.target.value)}
+                    aria-label="Sort notes"
                   >
-                    Clear tag
-                  </button>
+                    {SORT_MODES.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
+
+              {view === "notes" ? (
+                <div className="retro-filterbar" aria-label="Tag filters">
+                  <div className="retro-filterbar__row">
+                    <span className="retro-filterbar__label">Tags</span>
+                    <button
+                      type="button"
+                      className="btn retro-filterbar__clear"
+                      onClick={() => setActiveTag("")}
+                      disabled={!normalizeTag(activeTag)}
+                      title="Clear tag filter"
+                    >
+                      Clear tag
+                    </button>
+                  </div>
+
+                  {allTags.length === 0 ? (
+                    <div className="retro-filterbar__empty">No tags yet.</div>
+                  ) : (
+                    <div className="retro-tags" role="list">
+                      {allTags.map((t) => {
+                        const active = normalizeTag(activeTag) === normalizeTag(t);
+                        return (
+                          <button
+                            key={t}
+                            type="button"
+                            className={`retro-tag ${active ? "is-active" : ""}`}
+                            onClick={() => toggleActiveTag(t)}
+                            role="listitem"
+                            aria-pressed={active ? "true" : "false"}
+                            title={active ? "Remove filter" : `Filter by "${t}"`}
+                          >
+                            #{t}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="retro-filterbar" aria-label="Trash actions">
+                  <div className="retro-filterbar__row">
+                    <span className="retro-filterbar__label">Trash</span>
+                    <button
+                      type="button"
+                      className="btn btn-danger retro-filterbar__clear"
+                      onClick={emptyTrash}
+                      disabled={trashedNotes.length === 0}
+                      title={
+                        trashedNotes.length === 0
+                          ? "Trash is empty"
+                          : "Permanently delete everything in Trash"
+                      }
+                    >
+                      Empty
+                    </button>
+                  </div>
+                  <div className="retro-filterbar__empty">
+                    Trash items can be restored or permanently deleted.
+                  </div>
+                </div>
+              )}
+
+              <div id="search-help" className="retro-search__meta" aria-live="polite">
+                {query.trim() || (view === "notes" && normalizeTag(activeTag))
+                  ? `Showing ${resultsCount} of ${totalCount}`
+                  : `Showing all ${totalCount}`}
+                {view === "notes" && normalizeTag(activeTag)
+                  ? ` • TAG: ${normalizeTag(activeTag)}`
+                  : ""}
+              </div>
+            </div>
+
+            <div className="retro-list" role="list">
+              {visibleNotesSorted.length === 0 ? (
+                <div className="retro-empty" role="status">
+                  No matches.
+                </div>
+              ) : (
+                visibleNotesSorted.map((n) => {
+                  const active = n.id === selectedId;
+                  const preview =
+                    (n.body || "")
+                      .replace(/\s+/g, " ")
+                      .trim()
+                      .slice(0, 70) || "…";
+
+                  const isPinned = Boolean(n.pinned);
+                  const noteTags = (n.tags || []).map(normalizeTag).filter(Boolean);
+
+                  return (
+                    <div
+                      key={n.id}
+                      className={`retro-note-card-wrap ${active ? "is-active" : ""}`}
+                      role="listitem"
+                      aria-current={active ? "true" : "false"}
+                    >
+                      {view === "notes" ? (
+                        <button
+                          className="retro-note-card__pin"
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            togglePin(n.id);
+                          }}
+                          aria-label={isPinned ? "Unpin note" : "Pin note"}
+                          title={isPinned ? "Unpin note" : "Pin note"}
+                        >
+                          {isPinned ? "📌" : "📍"}
+                        </button>
+                      ) : (
+                        <div className="retro-note-card__pin" aria-hidden="true">
+                          🗑
+                        </div>
+                      )}
+
+                      <button
+                        className={`retro-note-card ${active ? "is-active" : ""}`}
+                        onClick={() => setSelectedId(n.id)}
+                        type="button"
+                      >
+                        <div className="retro-note-card__title">{n.title || "Untitled"}</div>
+                        <div className="retro-note-card__meta">
+                          {view === "trash"
+                            ? `Deleted: ${formatDate(n.deletedAt)}`
+                            : formatDate(n.updatedAt)}
+                          {view === "notes" && isPinned ? " • PINNED" : ""}
+                          {view === "notes" && noteTags.length ? ` • ${noteTags.length} TAGS` : ""}
+                        </div>
+
+                        {view === "notes" && noteTags.length ? (
+                          <div className="retro-note-card__tags" aria-label="Note tags">
+                            {noteTags.slice(0, 3).map((t) => (
+                              <span key={t} className="retro-tag-pill">
+                                #{t}
+                              </span>
+                            ))}
+                            {noteTags.length > 3 ? (
+                              <span className="retro-tag-pill retro-tag-pill--more">
+                                +{noteTags.length - 3}
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
+
+                        <div className="retro-note-card__preview">{preview}</div>
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </aside>
+
+          <section className="retro-editor" aria-label="Note editor">
+            <div className="retro-editor__toolbar">
+              <div className="retro-toolbar__left">
+                <span className="retro-status">
+                  {selectedNote ? (
+                    <>
+                      {view === "trash" ? "In Trash:" : "Editing:"}{" "}
+                      <strong className="retro-status__strong">
+                        {selectedNote.title || "Untitled"}
+                      </strong>
+                      {view === "notes" && activeSelectedNote ? (
+                        <span className="retro-autosave" aria-live="polite">
+                          {" "}
+                          • <span className={`retro-autosave__pill is-${autosaveStatus}`}>
+                            {autosaveLabel()}
+                          </span>
+                        </span>
+                      ) : null}
+                    </>
+                  ) : view === "trash" ? (
+                    emptyTrashState ? (
+                      "Trash is empty."
+                    ) : (
+                      "Select a trashed note."
+                    )
+                  ) : emptyState ? (
+                    "No notes yet."
+                  ) : (
+                    "Select a note to edit."
+                  )}
+                </span>
+              </div>
+
+              <div className="retro-toolbar__right">
+                {view === "notes" ? (
+                  <>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        if (!activeSelectedNote) return;
+                        setIsHistoryOpen((v) => {
+                          const next = !v;
+                          if (next) setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+                          return next;
+                        });
+                      }}
+                      disabled={!activeSelectedNote}
+                      title="Show version history"
+                    >
+                      History
+                    </button>
+
+                    {/* Reminders */}
+                    <div className="retro-reminder" role="group" aria-label="Reminders">
+                      {notificationsSupported() ? (
+                        notifPermission !== "granted" ? (
+                          <button
+                            type="button"
+                            className="btn"
+                            onClick={ensureNotificationPermission}
+                            title={
+                              notifPermission === "denied"
+                                ? "Notifications are blocked in browser settings"
+                                : "Enable notifications for reminders"
+                            }
+                          >
+                            Enable reminders
+                          </button>
+                        ) : null
+                      ) : (
+                        <button type="button" className="btn" disabled title="Not supported">
+                          Reminders unsupported
+                        </button>
+                      )}
+
+                      <input
+                        type="datetime-local"
+                        className="retro-input retro-reminder__input"
+                        disabled={
+                          !activeSelectedNote ||
+                          !notificationsSupported() ||
+                          notifPermission !== "granted"
+                        }
+                        value={(() => {
+                          const r =
+                            activeSelectedNote?.reminderAt ||
+                            getReminderForNote(activeSelectedNote?.id)?.remindAt;
+                          if (!r) return "";
+                          try {
+                            const d = new Date(r);
+                            const pad = (n) => String(n).padStart(2, "0");
+                            // datetime-local expects local time without seconds
+                            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+                              d.getDate()
+                            )}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                          } catch {
+                            return "";
+                          }
+                        })()}
+                        onChange={() => {}}
+                        aria-label="Reminder time"
+                        title="Pick a reminder time"
+                      />
+
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={
+                          !activeSelectedNote ||
+                          !notificationsSupported() ||
+                          notifPermission !== "granted"
+                        }
+                        onClick={() => {
+                          if (!activeSelectedNote) return;
+                          const input = document.querySelector(".retro-reminder__input");
+                          const value = input?.value;
+                          if (!value) {
+                            setError("Pick a reminder time first.");
+                            return;
+                          }
+                          const ms = new Date(value).getTime();
+                          setReminderForSelectedNote(ms);
+                        }}
+                        title="Schedule reminder"
+                      >
+                        Set reminder
+                      </button>
+
+                      <button
+                        type="button"
+                        className="btn btn-danger"
+                        disabled={!activeSelectedNote || !getReminderForNote(activeSelectedNote?.id)}
+                        onClick={clearReminderForSelectedNote}
+                        title="Cancel reminder"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        if (!activeSelectedNote) return;
+                        togglePin(activeSelectedNote.id);
+                      }}
+                      disabled={!activeSelectedNote}
+                      title={activeSelectedNote?.pinned ? "Unpin note" : "Pin note"}
+                    >
+                      {activeSelectedNote?.pinned ? "Unpin" : "Pin"}
+                    </button>
+
+                    <button
+                      className="btn"
+                      onClick={saveSelectedNote}
+                      disabled={!activeSelectedNote}
+                      title="Save changes"
+                    >
+                      Save
+                    </button>
+                    <button
+                      className="btn btn-danger"
+                      onClick={moveSelectedNoteToTrash}
+                      disabled={!activeSelectedNote}
+                      title="Move note to Trash"
+                    >
+                      Delete
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      className="btn"
+                      onClick={restoreSelectedNoteFromTrash}
+                      disabled={!trashSelectedNote}
+                      title="Restore note"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      className="btn btn-danger"
+                      onClick={permanentlyDeleteSelectedTrashNote}
+                      disabled={!trashSelectedNote}
+                      title="Permanently delete note"
+                    >
+                      Delete forever
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {view === "notes" && activeSelectedNote && isHistoryOpen ? (
+              <div className="retro-history" aria-label="Version history">
+                <div className="retro-history__head">
+                  <div className="retro-history__title">Version history</div>
+                  <div className="retro-history__actions">
+                    <button
+                      type="button"
+                      className="btn btn-small"
+                      onClick={() => {
+                        setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+                      }}
+                      title="Refresh snapshots"
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-small btn-danger"
+                      onClick={() => {
+                        const snaps = getNoteSnapshots(activeSelectedNote.id);
+                        if (snaps.length === 0) return;
+                        const ok = window.confirm(
+                          `Clear all ${snaps.length} snapshots for this note? This cannot be undone.`
+                        );
+                        if (!ok) return;
+                        clearNoteSnapshots(activeSelectedNote.id);
+                        setHistoryItems([]);
+                      }}
+                      disabled={historyItems.length === 0}
+                      title="Clear all snapshots"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-small"
+                      onClick={() => setIsHistoryOpen(false)}
+                      title="Close history"
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
 
-                {allTags.length === 0 ? (
-                  <div className="retro-filterbar__empty">No tags yet.</div>
+                {historyItems.length === 0 ? (
+                  <div className="retro-history__empty">
+                    No snapshots yet. They are created automatically on autosave and manual save.
+                  </div>
                 ) : (
-                  <div className="retro-tags" role="list">
-                    {allTags.map((t) => {
-                      const active = normalizeTag(activeTag) === normalizeTag(t);
+                  <div className="retro-history__list" role="list">
+                    {historyItems.slice(0, 12).map((s) => {
+                      const preview =
+                        (s.body || "").replace(/\s+/g, " ").trim().slice(0, 90) || "…";
                       return (
-                        <button
-                          key={t}
-                          type="button"
-                          className={`retro-tag ${active ? "is-active" : ""}`}
-                          onClick={() => toggleActiveTag(t)}
-                          role="listitem"
-                          aria-pressed={active ? "true" : "false"}
-                          title={active ? "Remove filter" : `Filter by "${t}"`}
-                        >
-                          #{t}
-                        </button>
+                        <div key={s.id} className="retro-history__item" role="listitem">
+                          <div className="retro-history__meta">
+                            <div className="retro-history__when">{formatDate(s.createdAt)}</div>
+                            <div className="retro-history__label">{s.title || "Untitled"}</div>
+                            <div className="retro-history__preview">{preview}</div>
+                          </div>
+                          <div className="retro-history__btns">
+                            <button
+                              type="button"
+                              className="btn btn-small"
+                              onClick={() => {
+                                const ok = window.confirm(
+                                  "Restore this snapshot? Current draft will be replaced."
+                                );
+                                if (!ok) return;
+
+                                setTitle(s.title);
+                                setBody(s.body);
+                                setAutosaveStatus("unsaved");
+                                setAutosaveMessage("Restored snapshot (not saved yet)");
+                              }}
+                              title="Restore snapshot (replaces current draft)"
+                            >
+                              Restore
+                            </button>
+                          </div>
+                        </div>
                       );
                     })}
                   </div>
                 )}
               </div>
-            ) : (
-              <div className="retro-filterbar" aria-label="Trash actions">
-                <div className="retro-filterbar__row">
-                  <span className="retro-filterbar__label">Trash</span>
-                  <button
-                    type="button"
-                    className="btn btn-danger retro-filterbar__clear"
-                    onClick={emptyTrash}
-                    disabled={trashedNotes.length === 0}
-                    title={
-                      trashedNotes.length === 0
-                        ? "Trash is empty"
-                        : "Permanently delete everything in Trash"
-                    }
-                  >
-                    Empty
-                  </button>
-                </div>
-                <div className="retro-filterbar__empty">
-                  Trash items can be restored or permanently deleted.
-                </div>
+            ) : null}
+
+            {error ? (
+              <div className="retro-alert" role="alert">
+                {error}
               </div>
-            )}
+            ) : null}
 
-            <div id="search-help" className="retro-search__meta" aria-live="polite">
-              {query.trim() || (view === "notes" && normalizeTag(activeTag))
-                ? `Showing ${resultsCount} of ${totalCount}`
-                : `Showing all ${totalCount}`}
-              {view === "notes" && normalizeTag(activeTag)
-                ? ` • TAG: ${normalizeTag(activeTag)}`
-                : ""}
-            </div>
-          </div>
-
-          <div className="retro-list" role="list">
-            {visibleNotesSorted.length === 0 ? (
-              <div className="retro-empty" role="status">
-                No matches.
-              </div>
-            ) : (
-              visibleNotesSorted.map((n) => {
-                const active = n.id === selectedId;
-                const preview =
-                  (n.body || "")
-                    .replace(/\s+/g, " ")
-                    .trim()
-                    .slice(0, 70) || "…";
-
-                const isPinned = Boolean(n.pinned);
-                const noteTags = (n.tags || []).map(normalizeTag).filter(Boolean);
-
-                return (
-                  <div
-                    key={n.id}
-                    className={`retro-note-card-wrap ${active ? "is-active" : ""}`}
-                    role="listitem"
-                    aria-current={active ? "true" : "false"}
-                  >
-                    {view === "notes" ? (
-                      <button
-                        className="retro-note-card__pin"
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          togglePin(n.id);
-                        }}
-                        aria-label={isPinned ? "Unpin note" : "Pin note"}
-                        title={isPinned ? "Unpin note" : "Pin note"}
-                      >
-                        {isPinned ? "📌" : "📍"}
-                      </button>
-                    ) : (
-                      <div className="retro-note-card__pin" aria-hidden="true">
-                        🗑
-                      </div>
-                    )}
-
-                    <button
-                      className={`retro-note-card ${active ? "is-active" : ""}`}
-                      onClick={() => setSelectedId(n.id)}
-                      type="button"
-                    >
-                      <div className="retro-note-card__title">{n.title || "Untitled"}</div>
-                      <div className="retro-note-card__meta">
-                        {view === "trash"
-                          ? `Deleted: ${formatDate(n.deletedAt)}`
-                          : formatDate(n.updatedAt)}
-                        {view === "notes" && isPinned ? " • PINNED" : ""}
-                        {view === "notes" && noteTags.length ? ` • ${noteTags.length} TAGS` : ""}
-                      </div>
-
-                      {view === "notes" && noteTags.length ? (
-                        <div className="retro-note-card__tags" aria-label="Note tags">
-                          {noteTags.slice(0, 3).map((t) => (
-                            <span key={t} className="retro-tag-pill">
-                              #{t}
-                            </span>
-                          ))}
-                          {noteTags.length > 3 ? (
-                            <span className="retro-tag-pill retro-tag-pill--more">
-                              +{noteTags.length - 3}
-                            </span>
-                          ) : null}
-                        </div>
-                      ) : null}
-
-                      <div className="retro-note-card__preview">{preview}</div>
-                    </button>
+            {view === "notes" ? (
+              activeSelectedNote ? (
+                <div className="retro-editor__form">
+                  <div className="retro-field">
+                    <label className="retro-label" htmlFor="title">
+                      Title
+                    </label>
+                    <input
+                      id="title"
+                      ref={titleInputRef}
+                      className="retro-input retro-input--title"
+                      value={title}
+                      onChange={(e) => setTitle(e.target.value)}
+                      placeholder="Untitled"
+                    />
                   </div>
-                );
-              })
-            )}
-          </div>
-        </aside>
 
-        <section className="retro-editor" aria-label="Note editor">
-          <div className="retro-editor__toolbar">
-            <div className="retro-toolbar__left">
-              <span className="retro-status">
-                {selectedNote ? (
-                  <>
-                    {view === "trash" ? "In Trash:" : "Editing:"}{" "}
-                    <strong className="retro-status__strong">
-                      {selectedNote.title || "Untitled"}
-                    </strong>
-                    {view === "notes" && activeSelectedNote ? (
-                      <span className="retro-autosave" aria-live="polite">
-                        {" "}
-                        • <span className={`retro-autosave__pill is-${autosaveStatus}`}>
-                          {autosaveLabel()}
-                        </span>
-                      </span>
-                    ) : null}
-                  </>
-                ) : view === "trash" ? (
-                  emptyTrashState ? (
-                    "Trash is empty."
-                  ) : (
-                    "Select a trashed note."
-                  )
-                ) : emptyState ? (
-                  "No notes yet."
-                ) : (
-                  "Select a note to edit."
-                )}
-              </span>
-            </div>
+                  <div className="retro-field">
+                    <div className="retro-labelrow">
+                      <label className="retro-label" htmlFor="body">
+                        Note
+                      </label>
 
-            <div className="retro-toolbar__right">
-              {view === "notes" ? (
-                <>
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      if (!activeSelectedNote) return;
-                      setIsHistoryOpen((v) => {
-                        const next = !v;
-                        if (next) setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
-                        return next;
-                      });
-                    }}
-                    disabled={!activeSelectedNote}
-                    title="Show version history"
-                  >
-                    History
-                  </button>
-
-                  {/* Reminders */}
-                  <div className="retro-reminder" role="group" aria-label="Reminders">
-                    {notificationsSupported() ? (
-                      notifPermission !== "granted" ? (
+                      <div className="retro-segtoggle" role="tablist" aria-label="Editor mode">
                         <button
                           type="button"
-                          className="btn"
-                          onClick={ensureNotificationPermission}
-                          title={
-                            notifPermission === "denied"
-                              ? "Notifications are blocked in browser settings"
-                              : "Enable notifications for reminders"
-                          }
+                          role="tab"
+                          className={`btn btn-small ${editorMode === "edit" ? "btn-primary" : ""}`}
+                          aria-selected={editorMode === "edit" ? "true" : "false"}
+                          aria-pressed={editorMode === "edit" ? "true" : "false"}
+                          onClick={() => setEditorMode("edit")}
+                          title="Edit note"
                         >
-                          Enable reminders
+                          Edit
                         </button>
-                      ) : null
+                        <button
+                          type="button"
+                          role="tab"
+                          className={`btn btn-small ${
+                            editorMode === "preview" ? "btn-primary" : ""
+                          }`}
+                          aria-selected={editorMode === "preview" ? "true" : "false"}
+                          aria-pressed={editorMode === "preview" ? "true" : "false"}
+                          onClick={() => setEditorMode("preview")}
+                          title="Preview Markdown"
+                        >
+                          Preview
+                        </button>
+                      </div>
+                    </div>
+
+                    {editorMode === "edit" ? (
+                      <textarea
+                        id="body"
+                        className="retro-textarea"
+                        value={body}
+                        onChange={(e) => setBody(e.target.value)}
+                        placeholder="Write something…"
+                        rows={12}
+                      />
                     ) : (
-                      <button type="button" className="btn" disabled title="Not supported">
-                        Reminders unsupported
-                      </button>
-                    )}
-
-                    <input
-                      type="datetime-local"
-                      className="retro-input retro-reminder__input"
-                      disabled={
-                        !activeSelectedNote ||
-                        !notificationsSupported() ||
-                        notifPermission !== "granted"
-                      }
-                      value={(() => {
-                        const r =
-                          activeSelectedNote?.reminderAt ||
-                          getReminderForNote(activeSelectedNote?.id)?.remindAt;
-                        if (!r) return "";
-                        try {
-                          const d = new Date(r);
-                          const pad = (n) => String(n).padStart(2, "0");
-                          // datetime-local expects local time without seconds
-                          return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
-                            d.getDate()
-                          )}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-                        } catch {
-                          return "";
-                        }
-                      })()}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        if (!v) return;
-                        const ms = new Date(v).getTime();
-                        if (!Number.isFinite(ms)) return;
-                      }}
-                      onBlur={() => {
-                        // No-op: we rely on Set button to schedule.
-                      }}
-                      aria-label="Reminder time"
-                      title="Pick a reminder time"
-                    />
-
-                    <button
-                      type="button"
-                      className="btn"
-                      disabled={
-                        !activeSelectedNote ||
-                        !notificationsSupported() ||
-                        notifPermission !== "granted"
-                      }
-                      onClick={() => {
-                        if (!activeSelectedNote) return;
-                        const input = document.querySelector(".retro-reminder__input");
-                        const value = input?.value;
-                        if (!value) {
-                          setError("Pick a reminder time first.");
-                          return;
-                        }
-                        const ms = new Date(value).getTime();
-                        setReminderForSelectedNote(ms);
-                      }}
-                      title="Schedule reminder"
-                    >
-                      Set reminder
-                    </button>
-
-                    <button
-                      type="button"
-                      className="btn btn-danger"
-                      disabled={!activeSelectedNote || !getReminderForNote(activeSelectedNote?.id)}
-                      onClick={clearReminderForSelectedNote}
-                      title="Cancel reminder"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-
-                  <button
-                    className="btn"
-                    onClick={() => {
-                      if (!activeSelectedNote) return;
-                      togglePin(activeSelectedNote.id);
-                    }}
-                    disabled={!activeSelectedNote}
-                    title={activeSelectedNote?.pinned ? "Unpin note" : "Pin note"}
-                  >
-                    {activeSelectedNote?.pinned ? "Unpin" : "Pin"}
-                  </button>
-
-                  <button
-                    className="btn"
-                    onClick={saveSelectedNote}
-                    disabled={!activeSelectedNote}
-                    title="Save changes"
-                  >
-                    Save
-                  </button>
-                  <button
-                    className="btn btn-danger"
-                    onClick={moveSelectedNoteToTrash}
-                    disabled={!activeSelectedNote}
-                    title="Move note to Trash"
-                  >
-                    Delete
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    className="btn"
-                    onClick={restoreSelectedNoteFromTrash}
-                    disabled={!trashSelectedNote}
-                    title="Restore note"
-                  >
-                    Restore
-                  </button>
-                  <button
-                    className="btn btn-danger"
-                    onClick={permanentlyDeleteSelectedTrashNote}
-                    disabled={!trashSelectedNote}
-                    title="Permanently delete note"
-                  >
-                    Delete forever
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {view === "notes" && activeSelectedNote && isHistoryOpen ? (
-            <div className="retro-history" aria-label="Version history">
-              <div className="retro-history__head">
-                <div className="retro-history__title">Version history</div>
-                <div className="retro-history__actions">
-                  <button
-                    type="button"
-                    className="btn btn-small"
-                    onClick={() => {
-                      setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
-                    }}
-                    title="Refresh snapshots"
-                  >
-                    Refresh
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-small btn-danger"
-                    onClick={() => {
-                      const snaps = getNoteSnapshots(activeSelectedNote.id);
-                      if (snaps.length === 0) return;
-                      const ok = window.confirm(
-                        `Clear all ${snaps.length} snapshots for this note? This cannot be undone.`
-                      );
-                      if (!ok) return;
-                      clearNoteSnapshots(activeSelectedNote.id);
-                      setHistoryItems([]);
-                    }}
-                    disabled={historyItems.length === 0}
-                    title="Clear all snapshots"
-                  >
-                    Clear
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-small"
-                    onClick={() => setIsHistoryOpen(false)}
-                    title="Close history"
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-
-              {historyItems.length === 0 ? (
-                <div className="retro-history__empty">
-                  No snapshots yet. They are created automatically on autosave and manual save.
-                </div>
-              ) : (
-                <div className="retro-history__list" role="list">
-                  {historyItems.slice(0, 12).map((s) => {
-                    const preview =
-                      (s.body || "").replace(/\s+/g, " ").trim().slice(0, 90) || "…";
-                    return (
-                      <div key={s.id} className="retro-history__item" role="listitem">
-                        <div className="retro-history__meta">
-                          <div className="retro-history__when">{formatDate(s.createdAt)}</div>
-                          <div className="retro-history__label">{s.title || "Untitled"}</div>
-                          <div className="retro-history__preview">{preview}</div>
+                      <div className="retro-md-preview-wrap" aria-label="Markdown preview">
+                        <div className="retro-md-preview__label">
+                          Preview (Markdown)
+                          <span className="retro-md-preview__hint">
+                            • <kbd>Ctrl/⌘</kbd>+<kbd>P</kbd> toggle
+                          </span>
                         </div>
-                        <div className="retro-history__btns">
-                          <button
-                            type="button"
-                            className="btn btn-small"
-                            onClick={() => {
-                              const ok = window.confirm(
-                                "Restore this snapshot? Current draft will be replaced."
-                              );
-                              if (!ok) return;
 
-                              setTitle(s.title);
-                              setBody(s.body);
-                              setAutosaveStatus("unsaved");
-                              setAutosaveMessage("Restored snapshot (not saved yet)");
+                        <div className="retro-readonly retro-md-preview" data-hotkeys="off">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            // Security hardening:
+                            // - Explicitly do NOT allow raw HTML rendering in Markdown
+                            // - Drop any parsed HTML nodes if present (defense-in-depth)
+                            // - Sanitize/validate URLs for links/images
+                            skipHtml={true}
+                            disallowedElements={[
+                              "script",
+                              "style",
+                              "iframe",
+                              "object",
+                              "embed",
+                              "link",
+                              "meta",
+                            ]}
+                            unwrapDisallowed={true}
+                            urlTransform={(url) => (isSafeUrl(url) ? url : "")}
+                            components={{
+                              a: ({ node, href, ...props }) => (
+                                <a
+                                  {...props}
+                                  href={isSafeUrl(href) ? href : undefined}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                />
+                              ),
+                              img: ({ node, src, alt, ...props }) =>
+                                isSafeUrl(src) ? (
+                                  <img {...props} src={src} alt={alt || ""} />
+                                ) : (
+                                  <span />
+                                ),
+                              // If raw HTML ever becomes enabled later, this keeps it safe.
+                              // (Not used with skipHtml=true, but kept for future-proofing.)
+                              div: ({ node, ...props }) => <div {...props} />,
                             }}
-                            title="Restore snapshot (replaces current draft)"
                           >
-                            Restore
-                          </button>
+                            {body && body.trim() ? body : "_Nothing to preview yet._"}
+                          </ReactMarkdown>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          ) : null}
+                    )}
+                  </div>
 
-          {error ? (
-            <div className="retro-alert" role="alert">
-              {error}
-            </div>
-          ) : null}
-
-          {view === "notes" ? (
-            activeSelectedNote ? (
-              <div className="retro-editor__form">
-                <div className="retro-field">
-                  <label className="retro-label" htmlFor="title">
-                    Title
-                  </label>
-                  <input
-                    id="title"
-                    ref={titleInputRef}
-                    className="retro-input retro-input--title"
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                    placeholder="Untitled"
-                  />
-                </div>
-
-                <div className="retro-field">
-                  <div className="retro-labelrow">
-                    <label className="retro-label" htmlFor="body">
-                      Note
+                  <div className="retro-field">
+                    <label className="retro-label" htmlFor="tags">
+                      Tags
                     </label>
 
-                    <div className="retro-segtoggle" role="tablist" aria-label="Editor mode">
-                      <button
-                        type="button"
-                        role="tab"
-                        className={`btn btn-small ${editorMode === "edit" ? "btn-primary" : ""}`}
-                        aria-selected={editorMode === "edit" ? "true" : "false"}
-                        aria-pressed={editorMode === "edit" ? "true" : "false"}
-                        onClick={() => setEditorMode("edit")}
-                        title="Edit note"
+                    <div className="retro-tags-editor" aria-label="Tags editor">
+                      <div className="retro-tags-editor__chips" aria-label="Selected note tags">
+                        {(activeSelectedNote.tags || []).length === 0 ? (
+                          <span className="retro-tags-editor__empty">No tags assigned.</span>
+                        ) : (
+                          (activeSelectedNote.tags || []).map((t) => {
+                            const norm = normalizeTag(t);
+                            return (
+                              <span key={norm} className="retro-tag-chip">
+                                <span className="retro-tag-chip__text">#{norm}</span>
+                                <button
+                                  type="button"
+                                  className="retro-tag-chip__remove"
+                                  onClick={() => removeTagFromSelectedNote(norm)}
+                                  aria-label={`Remove tag ${norm}`}
+                                  title={`Remove ${norm}`}
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      <form
+                        className="retro-tags-editor__form"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          addTagsToSelectedNote(tagDraft);
+                        }}
                       >
-                        Edit
-                      </button>
-                      <button
-                        type="button"
-                        role="tab"
-                        className={`btn btn-small ${
-                          editorMode === "preview" ? "btn-primary" : ""
-                        }`}
-                        aria-selected={editorMode === "preview" ? "true" : "false"}
-                        aria-pressed={editorMode === "preview" ? "true" : "false"}
-                        onClick={() => setEditorMode("preview")}
-                        title="Preview Markdown"
-                      >
-                        Preview
-                      </button>
+                        <input
+                          id="tags"
+                          className="retro-input retro-tags-editor__input"
+                          value={tagDraft}
+                          onChange={(e) => setTagDraft(e.target.value)}
+                          placeholder="Add tags (comma-separated)…"
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape") setTagDraft("");
+                          }}
+                          aria-describedby="tags-help"
+                        />
+                        <button
+                          type="submit"
+                          className="btn"
+                          disabled={!parseTagsInput(tagDraft).length}
+                          title="Add tags"
+                        >
+                          Add
+                        </button>
+                      </form>
+
+                      <div id="tags-help" className="retro-tags-editor__help">
+                        Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>, <kbd>todo</kbd>
+                      </div>
                     </div>
                   </div>
 
-                  {editorMode === "edit" ? (
-                    <textarea
-                      id="body"
-                      className="retro-textarea"
-                      value={body}
-                      onChange={(e) => setBody(e.target.value)}
-                      placeholder="Write something…"
-                      rows={12}
-                    />
-                  ) : (
-                    <div className="retro-md-preview-wrap" aria-label="Markdown preview">
-                      <div className="retro-md-preview__label">
-                        Preview (Markdown)
-                        <span className="retro-md-preview__hint">
-                          • <kbd>Ctrl/⌘</kbd>+<kbd>P</kbd> toggle
-                        </span>
-                      </div>
-
-                      <div className="retro-readonly retro-md-preview" data-hotkeys="off">
-                        <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
-                          // Security hardening:
-                          // - Explicitly do NOT allow raw HTML rendering in Markdown
-                          // - Drop any parsed HTML nodes if present (defense-in-depth)
-                          // - Sanitize/validate URLs for links/images
-                          skipHtml={true}
-                          disallowedElements={[
-                            "script",
-                            "style",
-                            "iframe",
-                            "object",
-                            "embed",
-                            "link",
-                            "meta",
-                          ]}
-                          unwrapDisallowed={true}
-                          urlTransform={(url) => (isSafeUrl(url) ? url : "")}
-                          components={{
-                            a: ({ node, href, ...props }) => (
-                              <a
-                                {...props}
-                                href={isSafeUrl(href) ? href : undefined}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                              />
-                            ),
-                            img: ({ node, src, alt, ...props }) =>
-                              isSafeUrl(src) ? (
-                                <img {...props} src={src} alt={alt || ""} />
-                              ) : (
-                                <span />
-                              ),
-                            // If raw HTML ever becomes enabled later, this keeps it safe.
-                            // (Not used with skipHtml=true, but kept for future-proofing.)
-                            div: ({ node, ...props }) => <div {...props} />,
-                          }}
-                        >
-                          {body && body.trim() ? body : "_Nothing to preview yet._"}
-                        </ReactMarkdown>
-                      </div>
+                  <div className="retro-footer">
+                    <div className="retro-hint">
+                      Tip: Changes autosave. Notes are encrypted in this browser (localStorage).{" "}
+                      <span className="retro-hint__soft">
+                        Use <kbd>Lock</kbd> to clear the passphrase from memory.
+                      </span>
                     </div>
+                    <div className="retro-timestamps">
+                      <span>
+                        Created: <strong>{formatDate(activeSelectedNote.createdAt)}</strong>
+                      </span>
+                      <span>
+                        Updated: <strong>{formatDate(activeSelectedNote.updatedAt)}</strong>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="retro-placeholder" role="status">
+                  {emptyState ? (
+                    <>
+                      <div className="retro-placeholder__title">Your desktop is empty.</div>
+                      <div className="retro-placeholder__body">Create your first note to begin.</div>
+                      <button className="btn btn-primary" onClick={createNewNote}>
+                        + New note
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="retro-placeholder__title">Select a note to edit.</div>
+                      <div className="retro-placeholder__body">
+                        Pick one from the list on the left, or create a new note.
+                      </div>
+                      <button className="btn btn-primary" onClick={createNewNote}>
+                        + New note
+                      </button>
+                    </>
                   )}
+                </div>
+              )
+            ) : trashSelectedNote ? (
+              <div className="retro-editor__form">
+                <div className="retro-field">
+                  <span className="retro-label">Title</span>
+                  <div className="retro-readonly">{trashSelectedNote.title || "Untitled"}</div>
                 </div>
 
                 <div className="retro-field">
-                  <label className="retro-label" htmlFor="tags">
-                    Tags
-                  </label>
-
-                  <div className="retro-tags-editor" aria-label="Tags editor">
-                    <div className="retro-tags-editor__chips" aria-label="Selected note tags">
-                      {(activeSelectedNote.tags || []).length === 0 ? (
-                        <span className="retro-tags-editor__empty">No tags assigned.</span>
-                      ) : (
-                        (activeSelectedNote.tags || []).map((t) => {
-                          const norm = normalizeTag(t);
-                          return (
-                            <span key={norm} className="retro-tag-chip">
-                              <span className="retro-tag-chip__text">#{norm}</span>
-                              <button
-                                type="button"
-                                className="retro-tag-chip__remove"
-                                onClick={() => removeTagFromSelectedNote(norm)}
-                                aria-label={`Remove tag ${norm}`}
-                                title={`Remove ${norm}`}
-                              >
-                                ×
-                              </button>
-                            </span>
-                          );
-                        })
-                      )}
-                    </div>
-
-                    <form
-                      className="retro-tags-editor__form"
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        addTagsToSelectedNote(tagDraft);
-                      }}
-                    >
-                      <input
-                        id="tags"
-                        className="retro-input retro-tags-editor__input"
-                        value={tagDraft}
-                        onChange={(e) => setTagDraft(e.target.value)}
-                        placeholder="Add tags (comma-separated)…"
-                        onKeyDown={(e) => {
-                          if (e.key === "Escape") setTagDraft("");
-                        }}
-                        aria-describedby="tags-help"
-                      />
-                      <button
-                        type="submit"
-                        className="btn"
-                        disabled={!parseTagsInput(tagDraft).length}
-                        title="Add tags"
-                      >
-                        Add
-                      </button>
-                    </form>
-
-                    <div id="tags-help" className="retro-tags-editor__help">
-                      Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>, <kbd>todo</kbd>
-                    </div>
-                  </div>
+                  <span className="retro-label">Note</span>
+                  <div className="retro-readonly retro-readonly--body">{trashSelectedNote.body || "…"}</div>
                 </div>
 
                 <div className="retro-footer">
-                  <div className="retro-hint">
-                    Tip: Changes autosave. Notes are stored in this browser (localStorage).{" "}
-                    <span className="retro-hint__soft">
-                      You can still use <kbd>Save</kbd> for an explicit save point.
-                    </span>
-                  </div>
+                  <div className="retro-hint">Trash is read-only. Restore to edit again.</div>
                   <div className="retro-timestamps">
                     <span>
-                      Created: <strong>{formatDate(activeSelectedNote.createdAt)}</strong>
+                      Created: <strong>{formatDate(trashSelectedNote.createdAt)}</strong>
                     </span>
                     <span>
-                      Updated: <strong>{formatDate(activeSelectedNote.updatedAt)}</strong>
+                      Deleted: <strong>{formatDate(trashSelectedNote.deletedAt)}</strong>
                     </span>
                   </div>
                 </div>
               </div>
             ) : (
               <div className="retro-placeholder" role="status">
-                {emptyState ? (
+                {emptyTrashState ? (
                   <>
-                    <div className="retro-placeholder__title">Your desktop is empty.</div>
-                    <div className="retro-placeholder__body">Create your first note to begin.</div>
-                    <button className="btn btn-primary" onClick={createNewNote}>
-                      + New note
+                    <div className="retro-placeholder__title">Trash is empty.</div>
+                    <div className="retro-placeholder__body">
+                      Deleted notes appear here until you restore them or delete forever.
+                    </div>
+                    <button className="btn" onClick={() => setView("notes")}>
+                      Back to Notes
                     </button>
                   </>
                 ) : (
                   <>
-                    <div className="retro-placeholder__title">Select a note to edit.</div>
-                    <div className="retro-placeholder__body">
-                      Pick one from the list on the left, or create a new note.
-                    </div>
-                    <button className="btn btn-primary" onClick={createNewNote}>
-                      + New note
-                    </button>
+                    <div className="retro-placeholder__title">Select a trashed note.</div>
+                    <div className="retro-placeholder__body">Restore it, or delete it forever.</div>
                   </>
                 )}
               </div>
-            )
-          ) : trashSelectedNote ? (
-            <div className="retro-editor__form">
-              <div className="retro-field">
-                <span className="retro-label">Title</span>
-                <div className="retro-readonly">{trashSelectedNote.title || "Untitled"}</div>
-              </div>
-
-              <div className="retro-field">
-                <span className="retro-label">Note</span>
-                <div className="retro-readonly retro-readonly--body">{trashSelectedNote.body || "…"}</div>
-              </div>
-
-              <div className="retro-footer">
-                <div className="retro-hint">Trash is read-only. Restore to edit again.</div>
-                <div className="retro-timestamps">
-                  <span>
-                    Created: <strong>{formatDate(trashSelectedNote.createdAt)}</strong>
-                  </span>
-                  <span>
-                    Deleted: <strong>{formatDate(trashSelectedNote.deletedAt)}</strong>
-                  </span>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="retro-placeholder" role="status">
-              {emptyTrashState ? (
-                <>
-                  <div className="retro-placeholder__title">Trash is empty.</div>
-                  <div className="retro-placeholder__body">
-                    Deleted notes appear here until you restore them or delete forever.
-                  </div>
-                  <button className="btn" onClick={() => setView("notes")}>
-                    Back to Notes
-                  </button>
-                </>
-              ) : (
-                <>
-                  <div className="retro-placeholder__title">Select a trashed note.</div>
-                  <div className="retro-placeholder__body">Restore it, or delete it forever.</div>
-                </>
-              )}
-            </div>
-          )}
-        </section>
-      </main>
+            )}
+          </section>
+        </main>
+      )}
 
       <footer className="retro-footerbar">
         <div className="retro-footerbar__left">
           <span className="retro-pip" aria-hidden="true" />
           <span>
-            {view === "trash" ? "Trash" : "Notes"}:{" "}
-            <strong>
-              {query.trim() || (view === "notes" && normalizeTag(activeTag))
-                ? `${resultsCount} / ${totalCount}`
-                : totalCount}
-            </strong>
+            {isUnlocked ? (
+              <>
+                {view === "trash" ? "Trash" : "Notes"}:{" "}
+                <strong>
+                  {query.trim() || (view === "notes" && normalizeTag(activeTag))
+                    ? `${resultsCount} / ${totalCount}`
+                    : totalCount}
+                </strong>
+              </>
+            ) : (
+              <>
+                Vault: <strong>Locked</strong>
+              </>
+            )}
           </span>
         </div>
 
         <div className="retro-footerbar__right">
           <span className="retro-mono">
-            <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> palette • <kbd>Ctrl/⌘</kbd>+<kbd>N</kbd> new •{" "}
-            <kbd>Ctrl/⌘</kbd>+<kbd>F</kbd>/<kbd>/</kbd> search • <kbd>Ctrl/⌘</kbd>+<kbd>1</kbd>/
-            <kbd>2</kbd> views • <kbd>Ctrl/⌘</kbd>+<kbd>T</kbd> tags •{" "}
-            {view === "trash" ? (
-              <>
-                <kbd>R</kbd> restore • <kbd>Del</kbd> delete
-              </>
-            ) : (
-              <>
-                <kbd>Ctrl/⌘</kbd>+<kbd>P</kbd> preview • <kbd>Del</kbd> trash
-              </>
-            )}
+            <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> palette • <kbd>Lock</kbd> clears passphrase from memory
           </span>
         </div>
       </footer>

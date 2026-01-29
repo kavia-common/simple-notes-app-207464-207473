@@ -82,6 +82,14 @@
   min-width: 240px;
 }
 
+.retro-header__right {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .retro-badge {
   font-family: var(--mono);
   font-weight: 700;

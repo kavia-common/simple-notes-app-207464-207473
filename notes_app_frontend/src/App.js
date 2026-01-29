@@ -10,6 +10,7 @@ function createId() {
 }
 
 const STORAGE_KEY = "retro_notes_v1";
+const EXPORT_SCHEMA_VERSION = 1;
 
 /**
  * @typedef {Object} Note
@@ -61,6 +62,56 @@ function parseTagsInput(raw) {
   return Array.from(new Set(parts));
 }
 
+/**
+ * Normalize/validate a raw object into a Note, or return null if unusable.
+ * This is used for both localStorage load and JSON import.
+ */
+function normalizeNote(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  // id is required; generate one if missing to avoid import failures.
+  const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : createId();
+
+  const createdAt = Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now();
+  const updatedAt = Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt;
+
+  const tags = Array.isArray(raw.tags)
+    ? Array.from(new Set(raw.tags.map((t) => normalizeTag(t)).filter(Boolean)))
+    : [];
+
+  return {
+    id,
+    title: typeof raw.title === "string" ? raw.title : "",
+    body: typeof raw.body === "string" ? raw.body : "",
+    createdAt,
+    updatedAt,
+    pinned: Boolean(raw.pinned),
+    tags,
+  };
+}
+
+/**
+ * Accept export payload formats:
+ * 1) Array<Note>
+ * 2) { schemaVersion, exportedAt, notes: Array<Note> }
+ */
+function extractNotesFromImportPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === "object" && Array.isArray(payload.notes)) {
+    return payload.notes;
+  }
+  return null;
+}
+
+function makeExportFileName() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(
+    d.getHours()
+  )}${pad(d.getMinutes())}`;
+  return `retro-notes_${stamp}.json`;
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /** @type {[Note[], Function]} */
@@ -79,6 +130,7 @@ function App() {
 
   const [error, setError] = useState("");
   const titleInputRef = useRef(null);
+  const importInputRef = useRef(null);
 
   // Load from localStorage once.
   useEffect(() => {
@@ -90,22 +142,8 @@ function App() {
       if (Array.isArray(parsed)) {
         // Basic validation / normalization
         const normalized = parsed
-          .filter((n) => n && typeof n.id === "string")
-          .map((n) => ({
-            id: String(n.id),
-            title: typeof n.title === "string" ? n.title : "",
-            body: typeof n.body === "string" ? n.body : "",
-            createdAt: Number.isFinite(n.createdAt) ? n.createdAt : Date.now(),
-            updatedAt: Number.isFinite(n.updatedAt) ? n.updatedAt : Date.now(),
-            pinned: Boolean(n.pinned),
-            tags: Array.isArray(n.tags)
-              ? Array.from(
-                  new Set(
-                    n.tags.map((t) => normalizeTag(t)).filter(Boolean)
-                  )
-                )
-              : [],
-          }))
+          .map((n) => normalizeNote(n))
+          .filter(Boolean)
           .sort(sortNotesPinnedFirst);
 
         setNotes(normalized);
@@ -338,6 +376,92 @@ function App() {
     setActiveTag((prev) => (normalizeTag(prev) === norm ? "" : norm));
   }
 
+  // PUBLIC_INTERFACE
+  function exportNotesToJson() {
+    /** Download notes as a JSON file (includes pinned state + tags). */
+    setError("");
+
+    try {
+      const payload = {
+        schemaVersion: EXPORT_SCHEMA_VERSION,
+        exportedAt: Date.now(),
+        app: "retro-notes",
+        notes,
+      };
+
+      const json = JSON.stringify(payload, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = makeExportFileName();
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      // Delay revoke to ensure the download starts in all browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 250);
+    } catch (e) {
+      console.error("Export failed:", e);
+      setError("Export failed. Please try again.");
+    }
+  }
+
+  // PUBLIC_INTERFACE
+  async function importNotesFromJsonFile(file) {
+    /** Import notes from a JSON file. Merges by id to avoid duplicates. */
+    setError("");
+
+    if (!file) return;
+
+    try {
+      if (!/\.json$/i.test(file.name) && file.type && file.type !== "application/json") {
+        // Soft check; still attempt to parse in case the browser doesn't set type.
+        console.warn("Import file does not look like JSON:", file.name, file.type);
+      }
+
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+
+      const incomingList = extractNotesFromImportPayload(parsed);
+      if (!incomingList) {
+        setError("Invalid import file format. Expected an array of notes or { notes: [...] }.");
+        return;
+      }
+
+      const normalizedIncoming = incomingList.map((n) => normalizeNote(n)).filter(Boolean);
+      if (normalizedIncoming.length === 0) {
+        setError("Import file contained no valid notes.");
+        return;
+      }
+
+      setNotes((prev) => {
+        // Merge by id: incoming overrides existing for the same id.
+        const byId = new Map(prev.map((n) => [n.id, n]));
+        for (const n of normalizedIncoming) byId.set(n.id, n);
+
+        const merged = Array.from(byId.values()).sort(sortNotesPinnedFirst);
+
+        // If nothing selected yet (or selection got removed), pick the first.
+        setSelectedId((curr) => {
+          if (curr && byId.has(curr)) return curr;
+          return merged.length ? merged[0].id : null;
+        });
+
+        return merged;
+      });
+
+      // Keep query/activeTag as-is to preserve current "search state".
+    } catch (e) {
+      console.error("Import failed:", e);
+      setError("Import failed (could not read/parse JSON).");
+    } finally {
+      // Allow importing the same file again by resetting the input value.
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
   function formatDate(ms) {
     try {
       return new Date(ms).toLocaleString(undefined, {
@@ -369,6 +493,36 @@ function App() {
         </div>
 
         <div className="retro-header__right">
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              importNotesFromJsonFile(f);
+            }}
+          />
+
+          <button
+            type="button"
+            className="btn"
+            onClick={() => importInputRef.current?.click()}
+            title="Import notes from JSON"
+          >
+            Import
+          </button>
+
+          <button
+            type="button"
+            className="btn"
+            onClick={exportNotesToJson}
+            disabled={notes.length === 0}
+            title={notes.length === 0 ? "No notes to export" : "Export notes to JSON"}
+          >
+            Export
+          </button>
+
           <button className="btn btn-primary" onClick={createNewNote}>
             + New note
           </button>

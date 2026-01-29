@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DOMPurify from "dompurify";
 import CommandPalette from "./components/CommandPalette";
+import TagManager from "./components/TagManager";
 import {
   cancelReminder,
   getNotificationPermission,
@@ -360,6 +361,9 @@ function App() {
   // Command palette UI state.
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
 
+  // Tag manager UI state.
+  const [isTagManagerOpen, setIsTagManagerOpen] = useState(false);
+
   // PUBLIC_INTERFACE
   function openCommandPalette() {
     /** Open the command palette modal. */
@@ -370,6 +374,18 @@ function App() {
   function closeCommandPalette() {
     /** Close the command palette modal. */
     setIsCommandPaletteOpen(false);
+  }
+
+  // PUBLIC_INTERFACE
+  function openTagManager() {
+    /** Open the tag manager modal. */
+    setIsTagManagerOpen(true);
+  }
+
+  // PUBLIC_INTERFACE
+  function closeTagManager() {
+    /** Close the tag manager modal. */
+    setIsTagManagerOpen(false);
   }
 
   // PUBLIC_INTERFACE
@@ -526,6 +542,18 @@ function App() {
       for (const t of n.tags || []) set.add(normalizeTag(t));
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [notes]);
+
+  const tagStats = useMemo(() => {
+    /** Build tag -> note count, for Tag Manager. */
+    const counts = new Map();
+    for (const n of notes) {
+      const uniq = new Set((n.tags || []).map(normalizeTag).filter(Boolean));
+      for (const t of uniq) counts.set(t, (counts.get(t) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => a.tag.localeCompare(b.tag));
   }, [notes]);
 
   const visibleNotes = useMemo(() => {
@@ -1137,6 +1165,114 @@ function App() {
   }
 
   // PUBLIC_INTERFACE
+  function renameTagGlobally(fromTag, toTag) {
+    /** Rename a tag across all active notes. If toTag exists, this effectively merges them. */
+    const from = normalizeTag(fromTag);
+    const to = normalizeTag(toTag);
+
+    if (!from || !to) return { ok: false, message: "Both tags are required." };
+    if (from === to) return { ok: false, message: "Nothing to do (same tag)." };
+
+    const used = new Set(allTags);
+    if (!used.has(from)) return { ok: false, message: `Tag "${from}" does not exist.` };
+
+    setNotes((prev) => {
+      const next = prev.map((n) => {
+        const tags = (n.tags || []).map(normalizeTag).filter(Boolean);
+        if (!tags.includes(from)) return n;
+
+        const replaced = tags.map((t) => (t === from ? to : t));
+        const deduped = Array.from(new Set(replaced));
+        return { ...n, tags: deduped };
+      });
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    // Keep active filter aligned if user is filtering on the renamed tag.
+    setActiveTag((prev) => (normalizeTag(prev) === from ? to : prev));
+
+    return { ok: true };
+  }
+
+  // PUBLIC_INTERFACE
+  function mergeTagsGlobally(fromTags, toTag) {
+    /** Merge one or more tags into a single tag across all active notes. */
+    const to = normalizeTag(toTag);
+    const fromList = Array.isArray(fromTags)
+      ? Array.from(new Set(fromTags.map(normalizeTag).filter(Boolean)))
+      : [];
+
+    if (!to) return { ok: false, message: "Target tag is required." };
+    if (fromList.length === 0) return { ok: false, message: "Select one or more tags to merge." };
+
+    // If the target is included in sources, we simply treat it as "keep target" and remove others.
+    const fromSet = new Set(fromList.filter((t) => t !== to));
+    if (fromSet.size === 0) return { ok: false, message: "Nothing to merge into target." };
+
+    const used = new Set(allTags);
+    const missing = Array.from(fromSet).filter((t) => !used.has(t));
+    if (missing.length) {
+      return { ok: false, message: `Unknown tag(s): ${missing.map((t) => `"${t}"`).join(", ")}` };
+    }
+
+    setNotes((prev) => {
+      const next = prev.map((n) => {
+        const tags = (n.tags || []).map(normalizeTag).filter(Boolean);
+        const hasAny = tags.some((t) => fromSet.has(t));
+        if (!hasAny) return n;
+
+        const filtered = tags.filter((t) => !fromSet.has(t));
+        const merged = Array.from(new Set([to, ...filtered]));
+        return { ...n, tags: merged };
+      });
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    // If activeTag is one of the merged tags, switch filter to target.
+    setActiveTag((prev) => (fromSet.has(normalizeTag(prev)) ? to : prev));
+
+    return { ok: true };
+  }
+
+  // PUBLIC_INTERFACE
+  function deleteTagGlobally(tag) {
+    /** Delete a tag across all active notes. */
+    const t = normalizeTag(tag);
+    if (!t) return { ok: false, message: "Tag is required." };
+
+    const used = new Set(allTags);
+    if (!used.has(t)) return { ok: false, message: `Tag "${t}" does not exist.` };
+
+    setNotes((prev) => {
+      const next = prev.map((n) => {
+        const tags = (n.tags || []).map(normalizeTag).filter(Boolean);
+        if (!tags.includes(t)) return n;
+        const filtered = tags.filter((x) => x !== t);
+        return { ...n, tags: filtered };
+      });
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    // Clear tag filter if it was deleted.
+    setActiveTag((prev) => (normalizeTag(prev) === t ? "" : prev));
+
+    return { ok: true };
+  }
+
+  // PUBLIC_INTERFACE
+  function focusTagFilter(tag) {
+    /** Convenience: set tag filter to a tag and close Tag Manager. */
+    const t = normalizeTag(tag);
+    if (!t) return;
+    setView("notes");
+    setActiveTag(t);
+    closeTagManager();
+  }
+
+  // PUBLIC_INTERFACE
   function exportNotesToJson() {
     /** Download notes as a JSON file (includes pinned state + tags + trash). */
     setError("");
@@ -1315,6 +1451,14 @@ function App() {
         return;
       }
 
+      // Tag Manager: Ctrl/Cmd+T (Notes view)
+      if (metaOrCtrl && lower === "t" && !ignore) {
+        if (view !== "notes") return;
+        e.preventDefault();
+        openTagManager();
+        return;
+      }
+
       // Delete shortcut when NOT typing
       if ((key === "Delete" || key === "Backspace") && !ignore) {
         // In Notes: delete -> move to trash
@@ -1342,11 +1486,17 @@ function App() {
         return;
       }
 
-      // Global escape: close palette first; otherwise clear search.
+      // Global escape: close modals first; otherwise clear search.
       if (key === "Escape" && !ignore) {
         if (isCommandPaletteOpen) {
           e.preventDefault();
           closeCommandPalette();
+          return;
+        }
+
+        if (isTagManagerOpen) {
+          e.preventDefault();
+          closeTagManager();
           return;
         }
 
@@ -1363,10 +1513,13 @@ function App() {
     view,
     query,
     isCommandPaletteOpen,
+    isTagManagerOpen,
     activeSelectedNote,
     trashSelectedNote,
     // actions
     createNewNote,
+    openTagManager,
+    closeTagManager,
     moveSelectedNoteToTrash,
     permanentlyDeleteSelectedTrashNote,
     restoreSelectedNoteFromTrash,
@@ -1460,6 +1613,20 @@ function App() {
         run: () => toggleTheme(),
       },
       {
+        id: "tag-manager",
+        label: "Tags: Open Tag Manager",
+        hint: "Ctrl/⌘+T",
+        keywords: ["tag", "tags", "rename", "merge", "delete"],
+        disabled: view !== "notes" || tagStats.length === 0,
+        disabledReason:
+          view !== "notes"
+            ? "Only available in Notes"
+            : tagStats.length === 0
+              ? "No tags yet"
+              : "",
+        run: () => openTagManager(),
+      },
+      {
         id: "toggle-md",
         label: toggleMdLabel,
         hint: "Ctrl/⌘+P",
@@ -1530,10 +1697,12 @@ function App() {
     activeSelectedNote,
     trashSelectedNote,
     isHistoryOpen,
+    tagStats.length,
     // actions + refs
     createNewNote,
     exportNotesToJson,
     toggleTheme,
+    openTagManager,
     restoreSelectedNoteFromTrash,
     permanentlyDeleteSelectedTrashNote,
     moveSelectedNoteToTrash,
@@ -1548,6 +1717,16 @@ function App() {
         isOpen={isCommandPaletteOpen}
         onClose={closeCommandPalette}
         items={commandPaletteItems}
+      />
+
+      <TagManager
+        isOpen={isTagManagerOpen}
+        onClose={closeTagManager}
+        tagStats={tagStats}
+        onFocusTag={focusTagFilter}
+        onRenameTag={renameTagGlobally}
+        onMergeTags={mergeTagsGlobally}
+        onDeleteTag={deleteTagGlobally}
       />
 
       <header className="retro-header">
@@ -1635,6 +1814,22 @@ function App() {
             }
           >
             Export
+          </button>
+
+          <button
+            type="button"
+            className="btn"
+            onClick={openTagManager}
+            disabled={view !== "notes" || tagStats.length === 0}
+            title={
+              view !== "notes"
+                ? "Tag Manager is available in Notes view"
+                : tagStats.length === 0
+                  ? "No tags yet"
+                  : "Manage tags (rename, merge, delete)"
+            }
+          >
+            Tags
           </button>
 
           <button className="btn btn-primary" onClick={createNewNote}>
@@ -2424,7 +2619,7 @@ function App() {
           <span className="retro-mono">
             <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> palette • <kbd>Ctrl/⌘</kbd>+<kbd>N</kbd> new •{" "}
             <kbd>Ctrl/⌘</kbd>+<kbd>F</kbd>/<kbd>/</kbd> search • <kbd>Ctrl/⌘</kbd>+<kbd>1</kbd>/
-            <kbd>2</kbd> views •{" "}
+            <kbd>2</kbd> views • <kbd>Ctrl/⌘</kbd>+<kbd>T</kbd> tags •{" "}
             {view === "trash" ? (
               <>
                 <kbd>R</kbd> restore • <kbd>Del</kbd> delete

@@ -18,7 +18,20 @@ const STORAGE_KEY = "retro_notes_v1";
  * @property {string} body
  * @property {number} createdAt
  * @property {number} updatedAt
+ * @property {boolean} pinned
  */
+
+/**
+ * Sort notes such that:
+ * 1) pinned notes come first
+ * 2) within the pinned/unpinned group, most recently updated comes first
+ */
+function sortNotesPinnedFirst(a, b) {
+  const ap = Boolean(a.pinned);
+  const bp = Boolean(b.pinned);
+  if (ap !== bp) return ap ? -1 : 1;
+  return (b.updatedAt || 0) - (a.updatedAt || 0);
+}
 
 // PUBLIC_INTERFACE
 function App() {
@@ -50,8 +63,9 @@ function App() {
             body: typeof n.body === "string" ? n.body : "",
             createdAt: Number.isFinite(n.createdAt) ? n.createdAt : Date.now(),
             updatedAt: Number.isFinite(n.updatedAt) ? n.updatedAt : Date.now(),
+            pinned: Boolean(n.pinned),
           }))
-          .sort((a, b) => b.updatedAt - a.updatedAt);
+          .sort(sortNotesPinnedFirst);
 
         setNotes(normalized);
         if (normalized.length > 0) {
@@ -90,7 +104,13 @@ function App() {
     });
   }, [notes, query]);
 
-  const resultsCount = filteredNotes.length;
+  const filteredNotesPinnedFirst = useMemo(() => {
+    // Keep the current search/filter behavior, but present pinned items first
+    // within the filtered results.
+    return [...filteredNotes].sort(sortNotesPinnedFirst);
+  }, [filteredNotes]);
+
+  const resultsCount = filteredNotesPinnedFirst.length;
   const totalCount = notes.length;
 
   // Keep editor fields in sync with selected note.
@@ -115,9 +135,10 @@ function App() {
       body: "",
       createdAt: now,
       updatedAt: now,
+      pinned: false,
     };
 
-    setNotes((prev) => [newNote, ...prev]);
+    setNotes((prev) => [newNote, ...prev].sort(sortNotesPinnedFirst));
     setSelectedId(newNote.id);
 
     // Focus title input next tick.
@@ -158,8 +179,8 @@ function App() {
             }
           : n
       );
-      // Keep most recently updated on top
-      updated.sort((a, b) => b.updatedAt - a.updatedAt);
+      // Keep pinned on top, then most recently updated
+      updated.sort(sortNotesPinnedFirst);
       return updated;
     });
   }
@@ -179,6 +200,18 @@ function App() {
       const next = prev.filter((n) => n.id !== selectedNote.id);
       // pick next selection
       setSelectedId(next.length ? next[0].id : null);
+      return next;
+    });
+  }
+
+  // PUBLIC_INTERFACE
+  function togglePin(noteId) {
+    /** Toggle pin/unpin for a note. */
+    setNotes((prev) => {
+      const next = prev.map((n) =>
+        n.id === noteId ? { ...n, pinned: !Boolean(n.pinned) } : n
+      );
+      next.sort(sortNotesPinnedFirst);
       return next;
     });
   }
@@ -258,35 +291,55 @@ function App() {
           </div>
 
           <div className="retro-list" role="list">
-            {filteredNotes.length === 0 ? (
+            {filteredNotesPinnedFirst.length === 0 ? (
               <div className="retro-empty" role="status">
                 No matches.
               </div>
             ) : (
-              filteredNotes.map((n) => {
+              filteredNotesPinnedFirst.map((n) => {
                 const active = n.id === selectedId;
                 const preview =
                   (n.body || "")
                     .replace(/\s+/g, " ")
                     .trim()
                     .slice(0, 70) || "…";
+                const isPinned = Boolean(n.pinned);
 
                 return (
-                  <button
+                  <div
                     key={n.id}
-                    className={`retro-note-card ${active ? "is-active" : ""}`}
-                    onClick={() => setSelectedId(n.id)}
+                    className={`retro-note-card-wrap ${active ? "is-active" : ""}`}
                     role="listitem"
                     aria-current={active ? "true" : "false"}
                   >
-                    <div className="retro-note-card__title">
-                      {n.title || "Untitled"}
-                    </div>
-                    <div className="retro-note-card__meta">
-                      {formatDate(n.updatedAt)}
-                    </div>
-                    <div className="retro-note-card__preview">{preview}</div>
-                  </button>
+                    <button
+                      className="retro-note-card__pin"
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        togglePin(n.id);
+                      }}
+                      aria-label={isPinned ? "Unpin note" : "Pin note"}
+                      title={isPinned ? "Unpin note" : "Pin note"}
+                    >
+                      {isPinned ? "📌" : "📍"}
+                    </button>
+
+                    <button
+                      className={`retro-note-card ${active ? "is-active" : ""}`}
+                      onClick={() => setSelectedId(n.id)}
+                      type="button"
+                    >
+                      <div className="retro-note-card__title">
+                        {n.title || "Untitled"}
+                      </div>
+                      <div className="retro-note-card__meta">
+                        {formatDate(n.updatedAt)}
+                        {isPinned ? " • PINNED" : ""}
+                      </div>
+                      <div className="retro-note-card__preview">{preview}</div>
+                    </button>
+                  </div>
                 );
               })
             )}
@@ -313,6 +366,18 @@ function App() {
             </div>
 
             <div className="retro-toolbar__right">
+              <button
+                className="btn"
+                onClick={() => {
+                  if (!selectedNote) return;
+                  togglePin(selectedNote.id);
+                }}
+                disabled={!selectedNote}
+                title={selectedNote?.pinned ? "Unpin note" : "Pin note"}
+              >
+                {selectedNote?.pinned ? "Unpin" : "Pin"}
+              </button>
+
               <button
                 className="btn"
                 onClick={saveSelectedNote}

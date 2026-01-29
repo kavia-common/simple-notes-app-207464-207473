@@ -144,6 +144,13 @@
   font-family: var(--mono);
 }
 
+.retro-note-card-wrap {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: stretch;
+  border-bottom: 1px solid rgba(86, 247, 212, 0.10);
+}
+
 .retro-note-card {
   width: 100%;
   text-align: left;
@@ -151,11 +158,31 @@
   background: transparent;
   color: var(--text);
   padding: 14px 14px 12px;
-  border-bottom: 1px solid rgba(86, 247, 212, 0.10);
   cursor: pointer;
   display: grid;
   gap: 6px;
   transition: background-color 0.15s ease, transform 0.08s ease;
+}
+
+.retro-note-card__pin {
+  border: none;
+  background: transparent;
+  color: rgba(240, 255, 250, 0.9);
+  padding: 10px 10px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  border-right: 1px solid rgba(86, 247, 212, 0.12);
+  transition: background-color 0.15s ease, transform 0.08s ease;
+}
+
+.retro-note-card__pin:hover {
+  background: rgba(86, 247, 212, 0.06);
+}
+
+.retro-note-card__pin:active {
+  transform: translateY(1px);
 }
 
 .retro-note-card:hover {

@@ -1207,6 +1207,210 @@ kbd {
   box-shadow: 0 0 16px rgba(14, 165, 233, 0.22);
 }
 
+/* Command palette (retro modal) */
+.cp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: start center;
+  padding: 80px 16px 16px;
+}
+
+.App[data-theme="light"] .cp-overlay {
+  background: rgba(2, 6, 23, 0.35);
+}
+
+.cp-modal {
+  width: min(720px, 100%);
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  padding: 14px;
+}
+
+.cp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed rgba(86, 247, 212, 0.16);
+  margin-bottom: 12px;
+}
+
+.App[data-theme="light"] .cp-head {
+  border-bottom-color: rgba(15, 23, 42, 0.14);
+}
+
+.cp-title {
+  font-family: var(--mono);
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  text-transform: uppercase;
+  color: rgba(240, 255, 250, 0.84);
+}
+
+.App[data-theme="light"] .cp-title {
+  color: rgba(15, 23, 42, 0.76);
+}
+
+.cp-label {
+  display: block;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: rgba(240, 255, 250, 0.72);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.App[data-theme="light"] .cp-label {
+  color: rgba(15, 23, 42, 0.62);
+}
+
+.cp-input {
+  margin-bottom: 12px;
+}
+
+.cp-list {
+  border-radius: 14px;
+  border: 1px solid rgba(86, 247, 212, 0.14);
+  background: rgba(7, 8, 18, 0.25);
+  overflow: auto;
+  max-height: min(52vh, 420px);
+}
+
+.App[data-theme="light"] .cp-list {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(2, 6, 23, 0.02);
+}
+
+.cp-empty {
+  padding: 14px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.cp-item {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 12px 12px;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  border-bottom: 1px solid rgba(86, 247, 212, 0.10);
+  transition: background-color 0.15s ease, transform 0.08s ease;
+}
+
+.App[data-theme="light"] .cp-item {
+  border-bottom-color: rgba(15, 23, 42, 0.10);
+}
+
+.cp-item:last-child {
+  border-bottom: none;
+}
+
+.cp-item:hover {
+  background: rgba(86, 247, 212, 0.06);
+}
+
+.App[data-theme="light"] .cp-item:hover {
+  background: rgba(2, 6, 23, 0.04);
+}
+
+.cp-item:active {
+  transform: translateY(1px);
+}
+
+.cp-item.is-active {
+  background: linear-gradient(
+    90deg,
+    rgba(86, 247, 212, 0.18),
+    rgba(124, 92, 255, 0.10)
+  );
+  box-shadow: inset 0 0 0 1px rgba(86, 247, 212, 0.22);
+}
+
+.App[data-theme="light"] .cp-item.is-active {
+  background: linear-gradient(
+    90deg,
+    rgba(14, 165, 233, 0.12),
+    rgba(124, 58, 237, 0.08)
+  );
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.12);
+}
+
+.cp-item.is-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.cp-item__label {
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.cp-item__right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.cp-item__hint,
+.cp-item__meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: rgba(240, 255, 250, 0.68);
+  white-space: nowrap;
+}
+
+.App[data-theme="light"] .cp-item__hint,
+.App[data-theme="light"] .cp-item__meta {
+  color: rgba(15, 23, 42, 0.58);
+}
+
+.cp-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(86, 247, 212, 0.16);
+  color: rgba(240, 255, 250, 0.65);
+  font-size: 12px;
+}
+
+.App[data-theme="light"] .cp-footer {
+  border-top-color: rgba(15, 23, 42, 0.14);
+  color: rgba(15, 23, 42, 0.60);
+}
+
+.cp-footer__left,
+.cp-footer__right {
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+}
+
+.cp-kbd {
+  display: inline-flex;
+  gap: 6px;
+}
+
 /* Responsive */
 @media (max-width: 980px) {
   .retro-main {
@@ -1225,5 +1429,9 @@ kbd {
   .retro-footer {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .cp-overlay {
+    padding-top: 64px;
   }
 }

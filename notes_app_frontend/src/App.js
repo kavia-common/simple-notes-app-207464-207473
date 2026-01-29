@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import CommandPalette from "./components/CommandPalette";
 import "./App.css";
 
 /**
@@ -255,6 +256,30 @@ function App() {
 
   // Keyboard shortcut focus targets.
   const searchInputRef = useRef(null);
+
+  // Command palette UI state.
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+
+  // PUBLIC_INTERFACE
+  function openCommandPalette() {
+    /** Open the command palette modal. */
+    setIsCommandPaletteOpen(true);
+  }
+
+  // PUBLIC_INTERFACE
+  function closeCommandPalette() {
+    /** Close the command palette modal. */
+    setIsCommandPaletteOpen(false);
+  }
+
+  // PUBLIC_INTERFACE
+  function focusSearch() {
+    /** Focus and select the search input (left sidebar). */
+    setTimeout(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select?.();
+    }, 0);
+  }
 
   // Persist theme preference.
   useEffect(() => {
@@ -846,14 +871,15 @@ function App() {
    * Install global keyboard shortcuts.
    *
    * Shortcuts:
+   * - Ctrl/Cmd + K: Command palette
    * - Ctrl/Cmd + N: New note
-   * - Ctrl/Cmd + K or / : Focus search
+   * - Ctrl/Cmd + F or / : Focus search
    * - Ctrl/Cmd + 1: Notes view
    * - Ctrl/Cmd + 2: Trash view
    * - Ctrl/Cmd + P: Toggle Markdown preview (Notes view)
    * - Delete / Backspace (when not typing): Move selected note to trash (Notes) / delete forever (Trash)
    * - R (Trash): Restore selected note
-   * - Esc (global): Clear search if not already handled by focused input; otherwise do nothing.
+   * - Esc (global): Close command palette; otherwise clear search if not already handled by focused input.
    */
   useEffect(() => {
     function onKeyDown(e) {
@@ -864,6 +890,13 @@ function App() {
       const lower = key.toLowerCase();
       const metaOrCtrl = e.metaKey || e.ctrlKey;
 
+      // Command palette: Ctrl/Cmd+K (common convention).
+      if (metaOrCtrl && lower === "k" && !ignore) {
+        e.preventDefault();
+        openCommandPalette();
+        return;
+      }
+
       // Always allow browser/system shortcuts like reload, devtools, etc.
       // We only preventDefault when we actually handle something.
       if (metaOrCtrl && lower === "n" && !ignore) {
@@ -872,13 +905,10 @@ function App() {
         return;
       }
 
-      // Focus search: Ctrl/Cmd+K is common; also support "/" when not typing.
-      if (((metaOrCtrl && lower === "k") || (!metaOrCtrl && lower === "/")) && !ignore) {
+      // Focus search: Ctrl/Cmd+F or "/" when not typing.
+      if (((metaOrCtrl && lower === "f") || (!metaOrCtrl && lower === "/")) && !ignore) {
         e.preventDefault();
-        setTimeout(() => {
-          searchInputRef.current?.focus();
-          searchInputRef.current?.select?.();
-        }, 0);
+        focusSearch();
         return;
       }
 
@@ -925,8 +955,14 @@ function App() {
         return;
       }
 
-      // Global escape: if not in an input, clear the search (matches user expectation).
+      // Global escape: close palette first; otherwise clear search.
       if (key === "Escape" && !ignore) {
+        if (isCommandPaletteOpen) {
+          e.preventDefault();
+          closeCommandPalette();
+          return;
+        }
+
         if (query.trim()) {
           e.preventDefault();
           setQuery("");
@@ -939,6 +975,7 @@ function App() {
   }, [
     view,
     query,
+    isCommandPaletteOpen,
     activeSelectedNote,
     trashSelectedNote,
     // actions
@@ -965,9 +1002,139 @@ function App() {
   const emptyState = notes.length === 0;
   const emptyTrashState = trashedNotes.length === 0;
 
+  const commandPaletteItems = useMemo(() => {
+    const hasAnyNotes = notes.length > 0 || trashedNotes.length > 0;
+    const hasSelectedNote = Boolean(activeSelectedNote);
+    const hasSelectedTrash = Boolean(trashSelectedNote);
+
+    const toggleViewLabel = view === "trash" ? "Go to Notes" : "Go to Trash";
+    const toggleViewHint = view === "trash" ? "Ctrl/⌘+1" : "Ctrl/⌘+2";
+
+    const toggleMdLabel =
+      editorMode === "preview" ? "Markdown: Switch to Edit" : "Markdown: Switch to Preview";
+
+    return [
+      {
+        id: "new-note",
+        label: "New note",
+        hint: "Ctrl/⌘+N",
+        keywords: ["create", "add", "note"],
+        run: () => createNewNote(),
+      },
+      {
+        id: "focus-search",
+        label: "Focus search",
+        hint: "Ctrl/⌘+F or /",
+        keywords: ["find", "filter", "search"],
+        run: () => focusSearch(),
+      },
+      {
+        id: "toggle-view",
+        label: toggleViewLabel,
+        hint: toggleViewHint,
+        keywords: ["notes", "trash", "view", "switch"],
+        run: () => setView(view === "trash" ? "notes" : "trash"),
+      },
+      {
+        id: "export",
+        label: "Export notes (JSON)",
+        hint: "Download",
+        keywords: ["backup", "download", "json"],
+        disabled: !hasAnyNotes,
+        disabledReason: !hasAnyNotes ? "No notes to export" : "",
+        run: () => exportNotesToJson(),
+      },
+      {
+        id: "import",
+        label: "Import notes (JSON)",
+        hint: "File…",
+        keywords: ["restore", "upload", "json"],
+        run: () => importInputRef.current?.click(),
+      },
+      {
+        id: "toggle-theme",
+        label: theme === "light" ? "Theme: Switch to Retro" : "Theme: Switch to Light",
+        hint: "Toggle",
+        keywords: ["appearance", "dark", "light", "retro"],
+        run: () => toggleTheme(),
+      },
+      {
+        id: "toggle-md",
+        label: toggleMdLabel,
+        hint: "Ctrl/⌘+P",
+        keywords: ["preview", "edit", "markdown"],
+        disabled: view !== "notes" || !hasSelectedNote,
+        disabledReason:
+          view !== "notes"
+            ? "Only available in Notes"
+            : !hasSelectedNote
+              ? "No note selected"
+              : "",
+        run: () => setEditorMode((m) => (m === "edit" ? "preview" : "edit")),
+      },
+      {
+        id: "restore",
+        label: "Restore selected note",
+        hint: "R",
+        keywords: ["trash", "restore", "undelete"],
+        disabled: view !== "trash" || !hasSelectedTrash,
+        disabledReason:
+          view !== "trash"
+            ? "Only available in Trash"
+            : !hasSelectedTrash
+              ? "No trashed note selected"
+              : "",
+        run: () => restoreSelectedNoteFromTrash(),
+      },
+      {
+        id: "delete",
+        label: view === "trash" ? "Delete selected forever" : "Move selected to Trash",
+        hint: "Del",
+        keywords: ["remove", "delete"],
+        disabled:
+          (view === "trash" && !hasSelectedTrash) || (view === "notes" && !hasSelectedNote),
+        disabledReason:
+          view === "trash"
+            ? !hasSelectedTrash
+              ? "No trashed note selected"
+              : ""
+            : !hasSelectedNote
+              ? "No note selected"
+              : "",
+        run: () =>
+          view === "trash"
+            ? permanentlyDeleteSelectedTrashNote()
+            : moveSelectedNoteToTrash(),
+      },
+    ];
+  }, [
+    notes.length,
+    trashedNotes.length,
+    view,
+    editorMode,
+    theme,
+    activeSelectedNote,
+    trashSelectedNote,
+    // actions + refs
+    createNewNote,
+    exportNotesToJson,
+    toggleTheme,
+    restoreSelectedNoteFromTrash,
+    permanentlyDeleteSelectedTrashNote,
+    moveSelectedNoteToTrash,
+    importInputRef,
+  ]);
+
   return (
     <div className="App" data-retro="true" data-theme={theme}>
       <div className="retro-bg" aria-hidden="true" />
+
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={closeCommandPalette}
+        items={commandPaletteItems}
+      />
+
       <header className="retro-header">
         <div className="retro-header__left">
           <div className="retro-badge" aria-hidden="true">
@@ -1602,8 +1769,9 @@ function App() {
 
         <div className="retro-footerbar__right">
           <span className="retro-mono">
-            <kbd>Ctrl/⌘</kbd>+<kbd>N</kbd> new • <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> search •{" "}
-            <kbd>Ctrl/⌘</kbd>+<kbd>1</kbd>/<kbd>2</kbd> views •{" "}
+            <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> palette • <kbd>Ctrl/⌘</kbd>+<kbd>N</kbd> new •{" "}
+            <kbd>Ctrl/⌘</kbd>+<kbd>F</kbd>/<kbd>/</kbd> search • <kbd>Ctrl/⌘</kbd>+<kbd>1</kbd>/
+            <kbd>2</kbd> views •{" "}
             {view === "trash" ? (
               <>
                 <kbd>R</kbd> restore • <kbd>Del</kbd> delete

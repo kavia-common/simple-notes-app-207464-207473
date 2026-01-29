@@ -10,6 +10,7 @@ function createId() {
 }
 
 const STORAGE_KEY = "retro_notes_v1";
+const SORT_MODE_KEY = "retro_notes_sort_mode_v1";
 const EXPORT_SCHEMA_VERSION = 1;
 
 /**
@@ -33,6 +34,44 @@ function sortNotesPinnedFirst(a, b) {
   const bp = Boolean(b.pinned);
   if (ap !== bp) return ap ? -1 : 1;
   return (b.updatedAt || 0) - (a.updatedAt || 0);
+}
+
+/**
+ * Available sort modes for the notes list.
+ * @typedef {"updated_desc"|"created_desc"|"title_asc"|"title_desc"} SortMode
+ */
+const SORT_MODES = [
+  { value: "updated_desc", label: "Last edited" },
+  { value: "created_desc", label: "Created date" },
+  { value: "title_asc", label: "Title (A→Z)" },
+  { value: "title_desc", label: "Title (Z→A)" },
+];
+
+/**
+ * Compare two notes by a given sort mode (does NOT account for pinning).
+ * Pinning-first ordering is applied separately to preserve the existing behavior.
+ */
+function compareNotesBySortMode(a, b, sortMode) {
+  const mode = sortMode || "updated_desc";
+
+  if (mode === "created_desc") return (b.createdAt || 0) - (a.createdAt || 0);
+  if (mode === "title_asc") return String(a.title || "").localeCompare(String(b.title || ""), undefined, { sensitivity: "base" });
+  if (mode === "title_desc") return String(b.title || "").localeCompare(String(a.title || ""), undefined, { sensitivity: "base" });
+
+  // Default: updated_desc
+  return (b.updatedAt || 0) - (a.updatedAt || 0);
+}
+
+/**
+ * Pinned-first comparator with a configurable secondary sort.
+ */
+function sortNotesPinnedFirstBy(sortMode) {
+  return (a, b) => {
+    const ap = Boolean(a.pinned);
+    const bp = Boolean(b.pinned);
+    if (ap !== bp) return ap ? -1 : 1;
+    return compareNotesBySortMode(a, b, sortMode);
+  };
 }
 
 /**
@@ -122,6 +161,9 @@ function App() {
   const [body, setBody] = useState("");
   const [query, setQuery] = useState("");
 
+  /** @type {[SortMode, Function]} */
+  const [sortMode, setSortMode] = useState("updated_desc");
+
   // Tag filter: which tag is currently selected in the list filter.
   const [activeTag, setActiveTag] = useState("");
 
@@ -135,6 +177,12 @@ function App() {
   // Load from localStorage once.
   useEffect(() => {
     try {
+      // Load sort mode (keep independent from notes payload for compatibility).
+      const storedSort = localStorage.getItem(SORT_MODE_KEY);
+      if (storedSort && SORT_MODES.some((m) => m.value === storedSort)) {
+        setSortMode(storedSort);
+      }
+
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
 
@@ -144,6 +192,7 @@ function App() {
         const normalized = parsed
           .map((n) => normalizeNote(n))
           .filter(Boolean)
+          // Preserve pinned-first behavior; initial load uses the existing default sort.
           .sort(sortNotesPinnedFirst);
 
         setNotes(normalized);
@@ -167,6 +216,16 @@ function App() {
       setError("Storage is full or unavailable. Changes may not persist.");
     }
   }, [notes]);
+
+  // Persist sort preference.
+  useEffect(() => {
+    try {
+      localStorage.setItem(SORT_MODE_KEY, sortMode);
+    } catch (e) {
+      console.error("Failed to persist sort mode:", e);
+      // Non-fatal; don't show user-facing error for sort preference persistence.
+    }
+  }, [sortMode]);
 
   const selectedNote = useMemo(() => {
     if (!selectedId) return null;
@@ -199,10 +258,10 @@ function App() {
   }, [notes, query, activeTag]);
 
   const filteredNotesPinnedFirst = useMemo(() => {
-    // Keep the current search/filter behavior, but present pinned items first
-    // within the filtered results.
-    return [...filteredNotes].sort(sortNotesPinnedFirst);
-  }, [filteredNotes]);
+    // Keep the current search/tag-filter behavior, but present pinned items first
+    // within the filtered results, then apply the chosen sort within each group.
+    return [...filteredNotes].sort(sortNotesPinnedFirstBy(sortMode));
+  }, [filteredNotes, sortMode]);
 
   const resultsCount = filteredNotesPinnedFirst.length;
   const totalCount = notes.length;
@@ -557,6 +616,25 @@ function App() {
               >
                 Clear
               </button>
+            </div>
+
+            <div className="retro-sortbar" aria-label="Sorting options">
+              <label className="retro-label" htmlFor="sort">
+                Sort
+              </label>
+              <select
+                id="sort"
+                className="retro-input retro-select"
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value)}
+                aria-label="Sort notes"
+              >
+                {SORT_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div className="retro-filterbar" aria-label="Tag filters">

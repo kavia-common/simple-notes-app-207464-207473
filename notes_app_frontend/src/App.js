@@ -19,6 +19,7 @@ const STORAGE_KEY = "retro_notes_v1";
  * @property {number} createdAt
  * @property {number} updatedAt
  * @property {boolean} pinned
+ * @property {string[]} tags
  */
 
 /**
@@ -33,6 +34,33 @@ function sortNotesPinnedFirst(a, b) {
   return (b.updatedAt || 0) - (a.updatedAt || 0);
 }
 
+/**
+ * Normalize a tag string:
+ * - trim
+ * - collapse inner whitespace
+ * - lower-case for consistent matching
+ */
+function normalizeTag(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+/**
+ * Convert a free-form string into a list of tags.
+ * Supports comma-separated input, and ignores empties.
+ */
+function parseTagsInput(raw) {
+  const parts = String(raw || "")
+    .split(",")
+    .map((p) => normalizeTag(p))
+    .filter(Boolean);
+
+  // de-dupe while preserving order
+  return Array.from(new Set(parts));
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /** @type {[Note[], Function]} */
@@ -42,6 +70,12 @@ function App() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [query, setQuery] = useState("");
+
+  // Tag filter: which tag is currently selected in the list filter.
+  const [activeTag, setActiveTag] = useState("");
+
+  // Tag input for the selected note.
+  const [tagDraft, setTagDraft] = useState("");
 
   const [error, setError] = useState("");
   const titleInputRef = useRef(null);
@@ -64,6 +98,13 @@ function App() {
             createdAt: Number.isFinite(n.createdAt) ? n.createdAt : Date.now(),
             updatedAt: Number.isFinite(n.updatedAt) ? n.updatedAt : Date.now(),
             pinned: Boolean(n.pinned),
+            tags: Array.isArray(n.tags)
+              ? Array.from(
+                  new Set(
+                    n.tags.map((t) => normalizeTag(t)).filter(Boolean)
+                  )
+                )
+              : [],
           }))
           .sort(sortNotesPinnedFirst);
 
@@ -94,15 +135,30 @@ function App() {
     return notes.find((n) => n.id === selectedId) || null;
   }, [notes, selectedId]);
 
+  const allTags = useMemo(() => {
+    const set = new Set();
+    for (const n of notes) {
+      for (const t of n.tags || []) set.add(normalizeTag(t));
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [notes]);
+
   const filteredNotes = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return notes;
+    const tag = normalizeTag(activeTag);
 
+    // Preserve existing search behavior, then apply tag filtering on top.
     return notes.filter((n) => {
+      if (tag) {
+        const tagMatch = (n.tags || []).map(normalizeTag).includes(tag);
+        if (!tagMatch) return false;
+      }
+
+      if (!q) return true;
       const hay = `${n.title}\n${n.body}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [notes, query]);
+  }, [notes, query, activeTag]);
 
   const filteredNotesPinnedFirst = useMemo(() => {
     // Keep the current search/filter behavior, but present pinned items first
@@ -119,10 +175,12 @@ function App() {
     if (!selectedNote) {
       setTitle("");
       setBody("");
+      setTagDraft("");
       return;
     }
     setTitle(selectedNote.title);
     setBody(selectedNote.body);
+    setTagDraft("");
   }, [selectedNote]);
 
   // PUBLIC_INTERFACE
@@ -136,6 +194,7 @@ function App() {
       createdAt: now,
       updatedAt: now,
       pinned: false,
+      tags: [],
     };
 
     setNotes((prev) => [newNote, ...prev].sort(sortNotesPinnedFirst));
@@ -216,6 +275,69 @@ function App() {
     });
   }
 
+  // PUBLIC_INTERFACE
+  function addTagsToSelectedNote(rawInput) {
+    /** Add one or more tags to the selected note. Accepts comma-separated input. */
+    setError("");
+
+    if (!selectedNote) {
+      setError("No note selected.");
+      return;
+    }
+
+    const newTags = parseTagsInput(rawInput);
+    if (newTags.length === 0) return;
+
+    setNotes((prev) => {
+      const next = prev.map((n) => {
+        if (n.id !== selectedNote.id) return n;
+        const merged = Array.from(
+          new Set([...(n.tags || []).map(normalizeTag), ...newTags])
+        );
+        return { ...n, tags: merged };
+      });
+      // Sorting not strictly needed, but keep behavior consistent (pins/updatedAt)
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    setTagDraft("");
+  }
+
+  // PUBLIC_INTERFACE
+  function removeTagFromSelectedNote(tagToRemove) {
+    /** Remove a tag from the selected note. */
+    setError("");
+
+    if (!selectedNote) {
+      setError("No note selected.");
+      return;
+    }
+
+    const norm = normalizeTag(tagToRemove);
+    if (!norm) return;
+
+    setNotes((prev) => {
+      const next = prev.map((n) => {
+        if (n.id !== selectedNote.id) return n;
+        const filtered = (n.tags || []).map(normalizeTag).filter((t) => t !== norm);
+        return { ...n, tags: filtered };
+      });
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    // If the user is currently filtering by a tag that got removed from all notes,
+    // keep the filter (it will simply show zero results) rather than changing behavior.
+  }
+
+  // PUBLIC_INTERFACE
+  function toggleActiveTag(tag) {
+    /** Toggle tag filter on/off. */
+    const norm = normalizeTag(tag);
+    setActiveTag((prev) => (normalizeTag(prev) === norm ? "" : norm));
+  }
+
   function formatDate(ms) {
     try {
       return new Date(ms).toLocaleString(undefined, {
@@ -283,10 +405,49 @@ function App() {
               </button>
             </div>
 
+            <div className="retro-filterbar" aria-label="Tag filters">
+              <div className="retro-filterbar__row">
+                <span className="retro-filterbar__label">Tags</span>
+                <button
+                  type="button"
+                  className="btn retro-filterbar__clear"
+                  onClick={() => setActiveTag("")}
+                  disabled={!normalizeTag(activeTag)}
+                  title="Clear tag filter"
+                >
+                  Clear tag
+                </button>
+              </div>
+
+              {allTags.length === 0 ? (
+                <div className="retro-filterbar__empty">No tags yet.</div>
+              ) : (
+                <div className="retro-tags" role="list">
+                  {allTags.map((t) => {
+                    const active = normalizeTag(activeTag) === normalizeTag(t);
+                    return (
+                      <button
+                        key={t}
+                        type="button"
+                        className={`retro-tag ${active ? "is-active" : ""}`}
+                        onClick={() => toggleActiveTag(t)}
+                        role="listitem"
+                        aria-pressed={active ? "true" : "false"}
+                        title={active ? "Remove filter" : `Filter by "${t}"`}
+                      >
+                        #{t}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
             <div id="search-help" className="retro-search__meta" aria-live="polite">
-              {query.trim()
+              {query.trim() || normalizeTag(activeTag)
                 ? `Showing ${resultsCount} of ${totalCount}`
                 : `Showing all ${totalCount}`}
+              {normalizeTag(activeTag) ? ` • TAG: ${normalizeTag(activeTag)}` : ""}
             </div>
           </div>
 
@@ -304,6 +465,7 @@ function App() {
                     .trim()
                     .slice(0, 70) || "…";
                 const isPinned = Boolean(n.pinned);
+                const noteTags = (n.tags || []).map(normalizeTag).filter(Boolean);
 
                 return (
                   <div
@@ -336,7 +498,24 @@ function App() {
                       <div className="retro-note-card__meta">
                         {formatDate(n.updatedAt)}
                         {isPinned ? " • PINNED" : ""}
+                        {noteTags.length ? ` • ${noteTags.length} TAGS` : ""}
                       </div>
+
+                      {noteTags.length ? (
+                        <div className="retro-note-card__tags" aria-label="Note tags">
+                          {noteTags.slice(0, 3).map((t) => (
+                            <span key={t} className="retro-tag-pill">
+                              #{t}
+                            </span>
+                          ))}
+                          {noteTags.length > 3 ? (
+                            <span className="retro-tag-pill retro-tag-pill--more">
+                              +{noteTags.length - 3}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
+
                       <div className="retro-note-card__preview">{preview}</div>
                     </button>
                   </div>
@@ -433,6 +612,70 @@ function App() {
                 />
               </div>
 
+              <div className="retro-field">
+                <label className="retro-label" htmlFor="tags">
+                  Tags
+                </label>
+
+                <div className="retro-tags-editor" aria-label="Tags editor">
+                  <div className="retro-tags-editor__chips" aria-label="Selected note tags">
+                    {(selectedNote.tags || []).length === 0 ? (
+                      <span className="retro-tags-editor__empty">No tags assigned.</span>
+                    ) : (
+                      (selectedNote.tags || []).map((t) => {
+                        const norm = normalizeTag(t);
+                        return (
+                          <span key={norm} className="retro-tag-chip">
+                            <span className="retro-tag-chip__text">#{norm}</span>
+                            <button
+                              type="button"
+                              className="retro-tag-chip__remove"
+                              onClick={() => removeTagFromSelectedNote(norm)}
+                              aria-label={`Remove tag ${norm}`}
+                              title={`Remove ${norm}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <form
+                    className="retro-tags-editor__form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      addTagsToSelectedNote(tagDraft);
+                    }}
+                  >
+                    <input
+                      id="tags"
+                      className="retro-input retro-tags-editor__input"
+                      value={tagDraft}
+                      onChange={(e) => setTagDraft(e.target.value)}
+                      placeholder="Add tags (comma-separated)…"
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setTagDraft("");
+                      }}
+                      aria-describedby="tags-help"
+                    />
+                    <button
+                      type="submit"
+                      className="btn"
+                      disabled={!parseTagsInput(tagDraft).length}
+                      title="Add tags"
+                    >
+                      Add
+                    </button>
+                  </form>
+
+                  <div id="tags-help" className="retro-tags-editor__help">
+                    Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>, <kbd>todo</kbd>
+                  </div>
+                </div>
+              </div>
+
               <div className="retro-footer">
                 <div className="retro-hint">
                   Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this
@@ -486,7 +729,9 @@ function App() {
           <span>
             Notes:{" "}
             <strong>
-              {query.trim() ? `${resultsCount} / ${totalCount}` : totalCount}
+              {query.trim() || normalizeTag(activeTag)
+                ? `${resultsCount} / ${totalCount}`
+                : totalCount}
             </strong>
           </span>
         </div>

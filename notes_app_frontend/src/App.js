@@ -1,47 +1,406 @@
-import React, { useState, useEffect } from 'react';
-import logo from './logo.svg';
-import './App.css';
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import "./App.css";
+
+/**
+ * Small helper to generate reasonably-unique ids without adding dependencies.
+ * Good enough for local-only notes.
+ */
+function createId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+const STORAGE_KEY = "retro_notes_v1";
+
+/**
+ * @typedef {Object} Note
+ * @property {string} id
+ * @property {string} title
+ * @property {string} body
+ * @property {number} createdAt
+ * @property {number} updatedAt
+ */
 
 // PUBLIC_INTERFACE
 function App() {
-  const [theme, setTheme] = useState('light');
+  /** @type {[Note[], Function]} */
+  const [notes, setNotes] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
 
-  // Effect to apply theme to document element
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [query, setQuery] = useState("");
+
+  const [error, setError] = useState("");
+  const titleInputRef = useRef(null);
+
+  // Load from localStorage once.
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-  }, [theme]);
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        // Basic validation / normalization
+        const normalized = parsed
+          .filter((n) => n && typeof n.id === "string")
+          .map((n) => ({
+            id: String(n.id),
+            title: typeof n.title === "string" ? n.title : "",
+            body: typeof n.body === "string" ? n.body : "",
+            createdAt: Number.isFinite(n.createdAt) ? n.createdAt : Date.now(),
+            updatedAt: Number.isFinite(n.updatedAt) ? n.updatedAt : Date.now(),
+          }))
+          .sort((a, b) => b.updatedAt - a.updatedAt);
+
+        setNotes(normalized);
+        if (normalized.length > 0) {
+          setSelectedId(normalized[0].id);
+        }
+      }
+    } catch (e) {
+      // Corrupted storage should not brick the UI.
+      console.error("Failed to load notes from storage:", e);
+      setError("Could not load saved notes (storage looked corrupted).");
+    }
+  }, []);
+
+  // Persist whenever notes change.
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
+    } catch (e) {
+      console.error("Failed to persist notes:", e);
+      setError("Storage is full or unavailable. Changes may not persist.");
+    }
+  }, [notes]);
+
+  const selectedNote = useMemo(() => {
+    if (!selectedId) return null;
+    return notes.find((n) => n.id === selectedId) || null;
+  }, [notes, selectedId]);
+
+  const filteredNotes = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return notes;
+
+    return notes.filter((n) => {
+      const hay = `${n.title}\n${n.body}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [notes, query]);
+
+  // Keep editor fields in sync with selected note.
+  useEffect(() => {
+    setError("");
+    if (!selectedNote) {
+      setTitle("");
+      setBody("");
+      return;
+    }
+    setTitle(selectedNote.title);
+    setBody(selectedNote.body);
+  }, [selectedNote]);
 
   // PUBLIC_INTERFACE
-  const toggleTheme = () => {
-    setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
-  };
+  function createNewNote() {
+    setError("");
+    const now = Date.now();
+    const newNote = {
+      id: createId(),
+      title: "Untitled",
+      body: "",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setNotes((prev) => [newNote, ...prev]);
+    setSelectedId(newNote.id);
+
+    // Focus title input next tick.
+    setTimeout(() => {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select?.();
+    }, 0);
+  }
+
+  // PUBLIC_INTERFACE
+  function saveSelectedNote() {
+    setError("");
+
+    if (!selectedNote) {
+      setError("No note selected.");
+      return;
+    }
+
+    const trimmedTitle = title.trim();
+    const trimmedBody = body.trimEnd(); // keep intentional leading spaces but normalize trailing
+
+    if (!trimmedTitle && !trimmedBody) {
+      setError("A note can't be completely empty. Add a title or some text.");
+      return;
+    }
+
+    const nextTitle = trimmedTitle || "Untitled";
+    const now = Date.now();
+
+    setNotes((prev) => {
+      const updated = prev.map((n) =>
+        n.id === selectedNote.id
+          ? {
+              ...n,
+              title: nextTitle,
+              body: trimmedBody,
+              updatedAt: now,
+            }
+          : n
+      );
+      // Keep most recently updated on top
+      updated.sort((a, b) => b.updatedAt - a.updatedAt);
+      return updated;
+    });
+  }
+
+  // PUBLIC_INTERFACE
+  function deleteSelectedNote() {
+    setError("");
+    if (!selectedNote) {
+      setError("No note selected.");
+      return;
+    }
+
+    const ok = window.confirm(`Delete "${selectedNote.title || "Untitled"}"?`);
+    if (!ok) return;
+
+    setNotes((prev) => {
+      const next = prev.filter((n) => n.id !== selectedNote.id);
+      // pick next selection
+      setSelectedId(next.length ? next[0].id : null);
+      return next;
+    });
+  }
+
+  function formatDate(ms) {
+    try {
+      return new Date(ms).toLocaleString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return "";
+    }
+  }
+
+  const emptyState = notes.length === 0;
 
   return (
-    <div className="App">
-      <header className="App-header">
-        <button 
-          className="theme-toggle" 
-          onClick={toggleTheme}
-          aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-        >
-          {theme === 'light' ? '🌙 Dark' : '☀️ Light'}
-        </button>
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <p>
-          Current theme: <strong>{theme}</strong>
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
+    <div className="App" data-retro="true">
+      <div className="retro-bg" aria-hidden="true" />
+      <header className="retro-header">
+        <div className="retro-header__left">
+          <div className="retro-badge" aria-hidden="true">
+            NOTES.EXE
+          </div>
+          <div className="retro-title-wrap">
+            <h1 className="retro-title">Retro Notes</h1>
+            <p className="retro-subtitle">Add, edit, delete — all offline.</p>
+          </div>
+        </div>
+
+        <div className="retro-header__right">
+          <button className="btn btn-primary" onClick={createNewNote}>
+            + New note
+          </button>
+        </div>
       </header>
+
+      <main className="retro-main">
+        <aside className="retro-sidebar" aria-label="Notes list">
+          <div className="retro-panel">
+            <label className="retro-label" htmlFor="search">
+              Search
+            </label>
+            <input
+              id="search"
+              className="retro-input"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Type to filter…"
+            />
+          </div>
+
+          <div className="retro-list" role="list">
+            {filteredNotes.length === 0 ? (
+              <div className="retro-empty" role="status">
+                No matches.
+              </div>
+            ) : (
+              filteredNotes.map((n) => {
+                const active = n.id === selectedId;
+                const preview =
+                  (n.body || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .slice(0, 70) || "…";
+
+                return (
+                  <button
+                    key={n.id}
+                    className={`retro-note-card ${active ? "is-active" : ""}`}
+                    onClick={() => setSelectedId(n.id)}
+                    role="listitem"
+                    aria-current={active ? "true" : "false"}
+                  >
+                    <div className="retro-note-card__title">
+                      {n.title || "Untitled"}
+                    </div>
+                    <div className="retro-note-card__meta">
+                      {formatDate(n.updatedAt)}
+                    </div>
+                    <div className="retro-note-card__preview">{preview}</div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </aside>
+
+        <section className="retro-editor" aria-label="Note editor">
+          <div className="retro-editor__toolbar">
+            <div className="retro-toolbar__left">
+              <span className="retro-status">
+                {selectedNote ? (
+                  <>
+                    Editing:{" "}
+                    <strong className="retro-status__strong">
+                      {selectedNote.title || "Untitled"}
+                    </strong>
+                  </>
+                ) : emptyState ? (
+                  "No notes yet."
+                ) : (
+                  "Select a note to edit."
+                )}
+              </span>
+            </div>
+
+            <div className="retro-toolbar__right">
+              <button
+                className="btn"
+                onClick={saveSelectedNote}
+                disabled={!selectedNote}
+                title="Save changes"
+              >
+                Save
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={deleteSelectedNote}
+                disabled={!selectedNote}
+                title="Delete note"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+
+          {error ? (
+            <div className="retro-alert" role="alert">
+              {error}
+            </div>
+          ) : null}
+
+          {selectedNote ? (
+            <div className="retro-editor__form">
+              <div className="retro-field">
+                <label className="retro-label" htmlFor="title">
+                  Title
+                </label>
+                <input
+                  id="title"
+                  ref={titleInputRef}
+                  className="retro-input retro-input--title"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder="Untitled"
+                />
+              </div>
+
+              <div className="retro-field">
+                <label className="retro-label" htmlFor="body">
+                  Note
+                </label>
+                <textarea
+                  id="body"
+                  className="retro-textarea"
+                  value={body}
+                  onChange={(e) => setBody(e.target.value)}
+                  placeholder="Write something…"
+                  rows={12}
+                />
+              </div>
+
+              <div className="retro-footer">
+                <div className="retro-hint">
+                  Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this
+                  browser (localStorage).
+                </div>
+                <div className="retro-timestamps">
+                  <span>
+                    Created: <strong>{formatDate(selectedNote.createdAt)}</strong>
+                  </span>
+                  <span>
+                    Updated: <strong>{formatDate(selectedNote.updatedAt)}</strong>
+                  </span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="retro-placeholder" role="status">
+              {emptyState ? (
+                <>
+                  <div className="retro-placeholder__title">
+                    Your desktop is empty.
+                  </div>
+                  <div className="retro-placeholder__body">
+                    Create your first note to begin.
+                  </div>
+                  <button className="btn btn-primary" onClick={createNewNote}>
+                    + New note
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="retro-placeholder__title">
+                    Select a note to edit.
+                  </div>
+                  <div className="retro-placeholder__body">
+                    Pick one from the list on the left, or create a new note.
+                  </div>
+                  <button className="btn btn-primary" onClick={createNewNote}>
+                    + New note
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </section>
+      </main>
+
+      <footer className="retro-footerbar">
+        <div className="retro-footerbar__left">
+          <span className="retro-pip" aria-hidden="true" />
+          <span>
+            Notes: <strong>{notes.length}</strong>
+          </span>
+        </div>
+        <div className="retro-footerbar__right">
+          <span className="retro-mono">LOCAL • OFFLINE • NO BACKEND</span>
+        </div>
+      </footer>
     </div>
   );
 }

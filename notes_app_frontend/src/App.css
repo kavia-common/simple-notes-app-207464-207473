@@ -124,6 +124,104 @@
   font-size: 13px;
 }
 
+/* Markdown preview (preview-only) */
+.retro-md-preview-wrap {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.retro-md-preview__label {
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: rgba(240, 255, 250, 0.72);
+  text-transform: uppercase;
+}
+
+.retro-md-preview {
+  /* Markdown needs normal wrapping; code blocks will handle their own pre formatting */
+  font-family: var(--sans);
+  white-space: normal;
+  overflow: auto;
+}
+
+.retro-md-preview :where(h1, h2, h3, h4) {
+  margin: 0.6em 0 0.3em;
+  line-height: 1.2;
+  text-shadow: 0 0 16px rgba(86, 247, 212, 0.10);
+}
+
+.retro-md-preview :where(p, ul, ol) {
+  margin: 0.5em 0;
+}
+
+.retro-md-preview :where(ul, ol) {
+  padding-left: 1.25em;
+}
+
+.retro-md-preview :where(code) {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(86, 247, 212, 0.18);
+  background: rgba(7, 8, 18, 0.55);
+  color: rgba(240, 255, 250, 0.92);
+}
+
+.retro-md-preview :where(pre) {
+  margin: 0.7em 0;
+  padding: 10px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(86, 247, 212, 0.16);
+  background: rgba(7, 8, 18, 0.55);
+  overflow: auto;
+}
+
+.retro-md-preview :where(pre code) {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.retro-md-preview :where(a) {
+  color: rgba(86, 247, 212, 0.92);
+  text-decoration: underline;
+  text-decoration-color: rgba(86, 247, 212, 0.35);
+}
+
+.retro-md-preview :where(blockquote) {
+  margin: 0.7em 0;
+  padding: 0.3em 0.9em;
+  border-left: 3px solid rgba(124, 92, 255, 0.5);
+  background: rgba(124, 92, 255, 0.08);
+  color: rgba(240, 255, 250, 0.85);
+}
+
+.retro-md-preview :where(hr) {
+  border: none;
+  border-top: 1px dashed rgba(86, 247, 212, 0.22);
+  margin: 0.9em 0;
+}
+
+.retro-md-preview :where(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 12px;
+}
+
+.retro-md-preview :where(th, td) {
+  border: 1px solid rgba(86, 247, 212, 0.16);
+  padding: 8px 8px;
+  text-align: left;
+}
+
+.retro-md-preview :where(th) {
+  background: rgba(18, 22, 48, 0.55);
+}
+
 .retro-badge {
   font-family: var(--mono);
   font-weight: 700;

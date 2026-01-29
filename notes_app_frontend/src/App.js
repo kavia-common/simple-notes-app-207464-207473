@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./App.css";
 
 /**
@@ -1304,6 +1306,32 @@ function App() {
                     placeholder="Write something…"
                     rows={12}
                   />
+
+                  <div className="retro-md-preview-wrap" aria-label="Markdown preview">
+                    <div className="retro-md-preview__label">
+                      Preview (Markdown)
+                    </div>
+
+                    <div className="retro-readonly retro-md-preview" data-hotkeys="off">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        // Keep Markdown rendering strictly "preview-only" and safe:
+                        // - no raw HTML rendering (default behavior)
+                        // - open links safely
+                        components={{
+                          a: ({ node, ...props }) => (
+                            <a
+                              {...props}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            />
+                          ),
+                        }}
+                      >
+                        {body && body.trim() ? body : "_Nothing to preview yet._"}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="retro-field">

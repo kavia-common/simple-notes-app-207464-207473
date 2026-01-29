@@ -10,8 +10,9 @@ function createId() {
 }
 
 const STORAGE_KEY = "retro_notes_v1";
+const TRASH_STORAGE_KEY = "retro_notes_trash_v1";
 const SORT_MODE_KEY = "retro_notes_sort_mode_v1";
-const EXPORT_SCHEMA_VERSION = 1;
+const EXPORT_SCHEMA_VERSION = 2;
 
 /**
  * @typedef {Object} Note
@@ -22,6 +23,7 @@ const EXPORT_SCHEMA_VERSION = 1;
  * @property {number} updatedAt
  * @property {boolean} pinned
  * @property {string[]} tags
+ * @property {number=} deletedAt
  */
 
 /**
@@ -55,8 +57,14 @@ function compareNotesBySortMode(a, b, sortMode) {
   const mode = sortMode || "updated_desc";
 
   if (mode === "created_desc") return (b.createdAt || 0) - (a.createdAt || 0);
-  if (mode === "title_asc") return String(a.title || "").localeCompare(String(b.title || ""), undefined, { sensitivity: "base" });
-  if (mode === "title_desc") return String(b.title || "").localeCompare(String(a.title || ""), undefined, { sensitivity: "base" });
+  if (mode === "title_asc")
+    return String(a.title || "").localeCompare(String(b.title || ""), undefined, {
+      sensitivity: "base",
+    });
+  if (mode === "title_desc")
+    return String(b.title || "").localeCompare(String(a.title || ""), undefined, {
+      sensitivity: "base",
+    });
 
   // Default: updated_desc
   return (b.updatedAt || 0) - (a.updatedAt || 0);
@@ -109,7 +117,8 @@ function normalizeNote(raw) {
   if (!raw || typeof raw !== "object") return null;
 
   // id is required; generate one if missing to avoid import failures.
-  const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : createId();
+  const id =
+    typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : createId();
 
   const createdAt = Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now();
   const updatedAt = Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt;
@@ -117,6 +126,9 @@ function normalizeNote(raw) {
   const tags = Array.isArray(raw.tags)
     ? Array.from(new Set(raw.tags.map((t) => normalizeTag(t)).filter(Boolean)))
     : [];
+
+  // Soft delete timestamp (if present).
+  const deletedAt = Number.isFinite(raw.deletedAt) ? raw.deletedAt : undefined;
 
   return {
     id,
@@ -126,6 +138,7 @@ function normalizeNote(raw) {
     updatedAt,
     pinned: Boolean(raw.pinned),
     tags,
+    deletedAt,
   };
 }
 
@@ -133,11 +146,20 @@ function normalizeNote(raw) {
  * Accept export payload formats:
  * 1) Array<Note>
  * 2) { schemaVersion, exportedAt, notes: Array<Note> }
+ * 3) { schemaVersion, exportedAt, activeNotes: Array<Note>, trashedNotes: Array<Note> }
  */
 function extractNotesFromImportPayload(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (payload && typeof payload === "object" && Array.isArray(payload.notes)) {
-    return payload.notes;
+  if (Array.isArray(payload)) return { activeNotes: payload, trashedNotes: [] };
+  if (payload && typeof payload === "object") {
+    if (Array.isArray(payload.notes)) {
+      return { activeNotes: payload.notes, trashedNotes: [] };
+    }
+    if (Array.isArray(payload.activeNotes) || Array.isArray(payload.trashedNotes)) {
+      return {
+        activeNotes: Array.isArray(payload.activeNotes) ? payload.activeNotes : [],
+        trashedNotes: Array.isArray(payload.trashedNotes) ? payload.trashedNotes : [],
+      };
+    }
   }
   return null;
 }
@@ -145,17 +167,24 @@ function extractNotesFromImportPayload(payload) {
 function makeExportFileName() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
-  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(
-    d.getHours()
-  )}${pad(d.getMinutes())}`;
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+    d.getDate()
+  )}_${pad(d.getHours())}${pad(d.getMinutes())}`;
   return `retro-notes_${stamp}.json`;
 }
+
+/** @typedef {"notes"|"trash"} AppView */
 
 // PUBLIC_INTERFACE
 function App() {
   /** @type {[Note[], Function]} */
   const [notes, setNotes] = useState([]);
+  /** @type {[Note[], Function]} */
+  const [trashedNotes, setTrashedNotes] = useState([]);
+
   const [selectedId, setSelectedId] = useState(null);
+  /** @type {[AppView, Function]} */
+  const [view, setView] = useState("notes");
 
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -183,21 +212,40 @@ function App() {
         setSortMode(storedSort);
       }
 
+      // Active notes (legacy key).
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const normalized = parsed
+            .map((n) => normalizeNote(n))
+            .filter(Boolean)
+            .map((n) => ({ ...n, deletedAt: undefined })) // ensure active notes are not "deleted"
+            .sort(sortNotesPinnedFirst);
 
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        // Basic validation / normalization
-        const normalized = parsed
-          .map((n) => normalizeNote(n))
-          .filter(Boolean)
-          // Preserve pinned-first behavior; initial load uses the existing default sort.
-          .sort(sortNotesPinnedFirst);
+          setNotes(normalized);
+          if (normalized.length > 0) {
+            setSelectedId(normalized[0].id);
+          }
+        }
+      }
 
-        setNotes(normalized);
-        if (normalized.length > 0) {
-          setSelectedId(normalized[0].id);
+      // Trashed notes (new key).
+      const trashRaw = localStorage.getItem(TRASH_STORAGE_KEY);
+      if (trashRaw) {
+        const parsedTrash = JSON.parse(trashRaw);
+        if (Array.isArray(parsedTrash)) {
+          const normalizedTrash = parsedTrash
+            .map((n) => normalizeNote(n))
+            .filter(Boolean)
+            .map((n) => ({
+              ...n,
+              deletedAt: Number.isFinite(n.deletedAt) ? n.deletedAt : Date.now(),
+              pinned: false, // pinned doesn't matter in trash; keep it simple
+            }))
+            .sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
+
+          setTrashedNotes(normalizedTrash);
         }
       }
     } catch (e) {
@@ -207,7 +255,7 @@ function App() {
     }
   }, []);
 
-  // Persist whenever notes change.
+  // Persist whenever active notes change.
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
@@ -216,6 +264,16 @@ function App() {
       setError("Storage is full or unavailable. Changes may not persist.");
     }
   }, [notes]);
+
+  // Persist whenever trash changes.
+  useEffect(() => {
+    try {
+      localStorage.setItem(TRASH_STORAGE_KEY, JSON.stringify(trashedNotes));
+    } catch (e) {
+      console.error("Failed to persist trash:", e);
+      setError("Storage is full or unavailable. Changes may not persist.");
+    }
+  }, [trashedNotes]);
 
   // Persist sort preference.
   useEffect(() => {
@@ -227,12 +285,20 @@ function App() {
     }
   }, [sortMode]);
 
-  const selectedNote = useMemo(() => {
+  const activeSelectedNote = useMemo(() => {
     if (!selectedId) return null;
     return notes.find((n) => n.id === selectedId) || null;
   }, [notes, selectedId]);
 
+  const trashSelectedNote = useMemo(() => {
+    if (!selectedId) return null;
+    return trashedNotes.find((n) => n.id === selectedId) || null;
+  }, [trashedNotes, selectedId]);
+
+  const selectedNote = view === "trash" ? trashSelectedNote : activeSelectedNote;
+
   const allTags = useMemo(() => {
+    // Tags are only meaningful for active notes (trash is not editable).
     const set = new Set();
     for (const n of notes) {
       for (const t of n.tags || []) set.add(normalizeTag(t));
@@ -240,12 +306,13 @@ function App() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [notes]);
 
-  const filteredNotes = useMemo(() => {
+  const visibleNotes = useMemo(() => {
+    const source = view === "trash" ? trashedNotes : notes;
     const q = query.trim().toLowerCase();
-    const tag = normalizeTag(activeTag);
+    const tag = view === "trash" ? "" : normalizeTag(activeTag);
 
-    // Preserve existing search behavior, then apply tag filtering on top.
-    return notes.filter((n) => {
+    // Preserve existing search behavior; tag filter only applies in Notes view.
+    return source.filter((n) => {
       if (tag) {
         const tagMatch = (n.tags || []).map(normalizeTag).includes(tag);
         if (!tagMatch) return false;
@@ -255,30 +322,62 @@ function App() {
       const hay = `${n.title}\n${n.body}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [notes, query, activeTag]);
+  }, [notes, trashedNotes, query, activeTag, view]);
 
-  const filteredNotesPinnedFirst = useMemo(() => {
-    // Keep the current search/tag-filter behavior, but present pinned items first
-    // within the filtered results, then apply the chosen sort within each group.
-    return [...filteredNotes].sort(sortNotesPinnedFirstBy(sortMode));
-  }, [filteredNotes, sortMode]);
+  const visibleNotesSorted = useMemo(() => {
+    if (view === "trash") {
+      // In trash, sort newest deleted first (simple, expected behavior).
+      return [...visibleNotes].sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
+    }
 
-  const resultsCount = filteredNotesPinnedFirst.length;
-  const totalCount = notes.length;
+    // Notes view: keep pinned-first + chosen sort mode.
+    return [...visibleNotes].sort(sortNotesPinnedFirstBy(sortMode));
+  }, [visibleNotes, sortMode, view]);
 
-  // Keep editor fields in sync with selected note.
+  const resultsCount = visibleNotesSorted.length;
+  const totalCount = view === "trash" ? trashedNotes.length : notes.length;
+
+  // Keep editor fields in sync with selected note (only for Notes view).
   useEffect(() => {
     setError("");
-    if (!selectedNote) {
+
+    if (view === "trash") {
       setTitle("");
       setBody("");
       setTagDraft("");
       return;
     }
-    setTitle(selectedNote.title);
-    setBody(selectedNote.body);
+
+    if (!activeSelectedNote) {
+      setTitle("");
+      setBody("");
+      setTagDraft("");
+      return;
+    }
+    setTitle(activeSelectedNote.title);
+    setBody(activeSelectedNote.body);
     setTagDraft("");
-  }, [selectedNote]);
+  }, [activeSelectedNote, view]);
+
+  // When switching views, ensure selectedId belongs to current list.
+  useEffect(() => {
+    setError("");
+    setSelectedId((curr) => {
+      if (!curr) {
+        const first = view === "trash" ? trashedNotes[0]?.id : notes[0]?.id;
+        return first || null;
+      }
+      const exists =
+        view === "trash"
+          ? trashedNotes.some((n) => n.id === curr)
+          : notes.some((n) => n.id === curr);
+      if (exists) return curr;
+
+      const first = view === "trash" ? trashedNotes[0]?.id : notes[0]?.id;
+      return first || null;
+    });
+    // In trash view, tag filter isn't applicable; keep it but it won't apply.
+  }, [view, notes, trashedNotes]);
 
   // PUBLIC_INTERFACE
   function createNewNote() {
@@ -295,6 +394,7 @@ function App() {
     };
 
     setNotes((prev) => [newNote, ...prev].sort(sortNotesPinnedFirst));
+    setView("notes");
     setSelectedId(newNote.id);
 
     // Focus title input next tick.
@@ -308,7 +408,12 @@ function App() {
   function saveSelectedNote() {
     setError("");
 
-    if (!selectedNote) {
+    if (view !== "notes") {
+      setError("Trash items can't be edited. Restore the note first.");
+      return;
+    }
+
+    if (!activeSelectedNote) {
       setError("No note selected.");
       return;
     }
@@ -326,7 +431,7 @@ function App() {
 
     setNotes((prev) => {
       const updated = prev.map((n) =>
-        n.id === selectedNote.id
+        n.id === activeSelectedNote.id
           ? {
               ...n,
               title: nextTitle,
@@ -335,34 +440,130 @@ function App() {
             }
           : n
       );
-      // Keep pinned on top, then most recently updated
       updated.sort(sortNotesPinnedFirst);
       return updated;
     });
   }
 
   // PUBLIC_INTERFACE
-  function deleteSelectedNote() {
+  function moveSelectedNoteToTrash() {
+    /** Soft delete: remove from active list and move into Trash. */
     setError("");
-    if (!selectedNote) {
+    if (view !== "notes") {
+      setError("Switch to Notes to delete notes.");
+      return;
+    }
+    if (!activeSelectedNote) {
       setError("No note selected.");
       return;
     }
 
-    const ok = window.confirm(`Delete "${selectedNote.title || "Untitled"}"?`);
+    const ok = window.confirm(
+      `Move "${activeSelectedNote.title || "Untitled"}" to Trash?`
+    );
     if (!ok) return;
 
+    const deletedAt = Date.now();
+
     setNotes((prev) => {
-      const next = prev.filter((n) => n.id !== selectedNote.id);
-      // pick next selection
+      const next = prev.filter((n) => n.id !== activeSelectedNote.id);
+      // pick next selection in notes view
+      setSelectedId(next.length ? next[0].id : null);
+      return next;
+    });
+
+    setTrashedNotes((prev) => {
+      const trashedCopy = {
+        ...activeSelectedNote,
+        pinned: false,
+        deletedAt,
+      };
+      // Avoid duplicates if somehow already in trash
+      const filtered = prev.filter((n) => n.id !== trashedCopy.id);
+      return [trashedCopy, ...filtered].sort(
+        (a, b) => (b.deletedAt || 0) - (a.deletedAt || 0)
+      );
+    });
+  }
+
+  // PUBLIC_INTERFACE
+  function restoreSelectedNoteFromTrash() {
+    /** Restore: move from Trash back to Notes. */
+    setError("");
+    if (view !== "trash") {
+      setError("Switch to Trash to restore notes.");
+      return;
+    }
+    if (!trashSelectedNote) {
+      setError("No trashed note selected.");
+      return;
+    }
+
+    setTrashedNotes((prev) => {
+      const next = prev.filter((n) => n.id !== trashSelectedNote.id);
+      // pick next selection in trash view
+      setSelectedId(next.length ? next[0].id : null);
+      return next;
+    });
+
+    setNotes((prev) => {
+      const restored = {
+        ...trashSelectedNote,
+        deletedAt: undefined,
+        pinned: false, // restored notes come back unpinned to avoid surprising "jump to top"
+        updatedAt: Date.now(), // make restore visible in "Last edited" sort
+      };
+      const filtered = prev.filter((n) => n.id !== restored.id);
+      const merged = [restored, ...filtered].sort(sortNotesPinnedFirst);
+      return merged;
+    });
+  }
+
+  // PUBLIC_INTERFACE
+  function permanentlyDeleteSelectedTrashNote() {
+    /** Permanent delete: remove from Trash forever. */
+    setError("");
+    if (view !== "trash") {
+      setError("Switch to Trash to permanently delete notes.");
+      return;
+    }
+    if (!trashSelectedNote) {
+      setError("No trashed note selected.");
+      return;
+    }
+
+    const ok = window.confirm(
+      `Permanently delete "${trashSelectedNote.title || "Untitled"}"? This cannot be undone.`
+    );
+    if (!ok) return;
+
+    setTrashedNotes((prev) => {
+      const next = prev.filter((n) => n.id !== trashSelectedNote.id);
       setSelectedId(next.length ? next[0].id : null);
       return next;
     });
   }
 
   // PUBLIC_INTERFACE
+  function emptyTrash() {
+    /** Permanently delete ALL notes from Trash. */
+    setError("");
+    if (trashedNotes.length === 0) return;
+
+    const ok = window.confirm(
+      `Empty Trash (${trashedNotes.length} item${trashedNotes.length === 1 ? "" : "s"})? This cannot be undone.`
+    );
+    if (!ok) return;
+
+    setTrashedNotes([]);
+    setSelectedId(null);
+  }
+
+  // PUBLIC_INTERFACE
   function togglePin(noteId) {
     /** Toggle pin/unpin for a note. */
+    if (view !== "notes") return;
+
     setNotes((prev) => {
       const next = prev.map((n) =>
         n.id === noteId ? { ...n, pinned: !Boolean(n.pinned) } : n
@@ -377,7 +578,12 @@ function App() {
     /** Add one or more tags to the selected note. Accepts comma-separated input. */
     setError("");
 
-    if (!selectedNote) {
+    if (view !== "notes") {
+      setError("Trash items can't be tagged. Restore the note first.");
+      return;
+    }
+
+    if (!activeSelectedNote) {
       setError("No note selected.");
       return;
     }
@@ -387,13 +593,12 @@ function App() {
 
     setNotes((prev) => {
       const next = prev.map((n) => {
-        if (n.id !== selectedNote.id) return n;
+        if (n.id !== activeSelectedNote.id) return n;
         const merged = Array.from(
           new Set([...(n.tags || []).map(normalizeTag), ...newTags])
         );
         return { ...n, tags: merged };
       });
-      // Sorting not strictly needed, but keep behavior consistent (pins/updatedAt)
       next.sort(sortNotesPinnedFirst);
       return next;
     });
@@ -406,7 +611,12 @@ function App() {
     /** Remove a tag from the selected note. */
     setError("");
 
-    if (!selectedNote) {
+    if (view !== "notes") {
+      setError("Trash items can't be edited. Restore the note first.");
+      return;
+    }
+
+    if (!activeSelectedNote) {
       setError("No note selected.");
       return;
     }
@@ -416,16 +626,13 @@ function App() {
 
     setNotes((prev) => {
       const next = prev.map((n) => {
-        if (n.id !== selectedNote.id) return n;
+        if (n.id !== activeSelectedNote.id) return n;
         const filtered = (n.tags || []).map(normalizeTag).filter((t) => t !== norm);
         return { ...n, tags: filtered };
       });
       next.sort(sortNotesPinnedFirst);
       return next;
     });
-
-    // If the user is currently filtering by a tag that got removed from all notes,
-    // keep the filter (it will simply show zero results) rather than changing behavior.
   }
 
   // PUBLIC_INTERFACE
@@ -437,7 +644,7 @@ function App() {
 
   // PUBLIC_INTERFACE
   function exportNotesToJson() {
-    /** Download notes as a JSON file (includes pinned state + tags). */
+    /** Download notes as a JSON file (includes pinned state + tags + trash). */
     setError("");
 
     try {
@@ -445,7 +652,8 @@ function App() {
         schemaVersion: EXPORT_SCHEMA_VERSION,
         exportedAt: Date.now(),
         app: "retro-notes",
-        notes,
+        activeNotes: notes,
+        trashedNotes,
       };
 
       const json = JSON.stringify(payload, null, 2);
@@ -483,14 +691,29 @@ function App() {
       const text = await file.text();
       const parsed = JSON.parse(text);
 
-      const incomingList = extractNotesFromImportPayload(parsed);
-      if (!incomingList) {
-        setError("Invalid import file format. Expected an array of notes or { notes: [...] }.");
+      const extracted = extractNotesFromImportPayload(parsed);
+      if (!extracted) {
+        setError(
+          'Invalid import file format. Expected an array of notes, { notes: [...] }, or { activeNotes: [...], trashedNotes: [...] }.'
+        );
         return;
       }
 
-      const normalizedIncoming = incomingList.map((n) => normalizeNote(n)).filter(Boolean);
-      if (normalizedIncoming.length === 0) {
+      const normalizedIncomingActive = (extracted.activeNotes || [])
+        .map((n) => normalizeNote(n))
+        .filter(Boolean)
+        .map((n) => ({ ...n, deletedAt: undefined }));
+
+      const normalizedIncomingTrash = (extracted.trashedNotes || [])
+        .map((n) => normalizeNote(n))
+        .filter(Boolean)
+        .map((n) => ({
+          ...n,
+          deletedAt: Number.isFinite(n.deletedAt) ? n.deletedAt : Date.now(),
+          pinned: false,
+        }));
+
+      if (normalizedIncomingActive.length === 0 && normalizedIncomingTrash.length === 0) {
         setError("Import file contained no valid notes.");
         return;
       }
@@ -498,12 +721,28 @@ function App() {
       setNotes((prev) => {
         // Merge by id: incoming overrides existing for the same id.
         const byId = new Map(prev.map((n) => [n.id, n]));
-        for (const n of normalizedIncoming) byId.set(n.id, n);
-
+        for (const n of normalizedIncomingActive) byId.set(n.id, n);
         const merged = Array.from(byId.values()).sort(sortNotesPinnedFirst);
 
-        // If nothing selected yet (or selection got removed), pick the first.
+        // If current selection belongs to notes view, keep it if possible.
         setSelectedId((curr) => {
+          if (view !== "notes") return curr;
+          if (curr && byId.has(curr)) return curr;
+          return merged.length ? merged[0].id : null;
+        });
+
+        return merged;
+      });
+
+      setTrashedNotes((prev) => {
+        const byId = new Map(prev.map((n) => [n.id, n]));
+        for (const n of normalizedIncomingTrash) byId.set(n.id, n);
+        const merged = Array.from(byId.values()).sort(
+          (a, b) => (b.deletedAt || 0) - (a.deletedAt || 0)
+        );
+
+        setSelectedId((curr) => {
+          if (view !== "trash") return curr;
           if (curr && byId.has(curr)) return curr;
           return merged.length ? merged[0].id : null;
         });
@@ -536,6 +775,7 @@ function App() {
   }
 
   const emptyState = notes.length === 0;
+  const emptyTrashState = trashedNotes.length === 0;
 
   return (
     <div className="App" data-retro="true">
@@ -547,7 +787,12 @@ function App() {
           </div>
           <div className="retro-title-wrap">
             <h1 className="retro-title">Retro Notes</h1>
-            <p className="retro-subtitle">Add, edit, delete — all offline.</p>
+            <p className="retro-subtitle">
+              Add, edit, delete — all offline.{" "}
+              <span className="retro-viewhint" aria-hidden="true">
+                • {view === "trash" ? "TRASH" : "NOTES"}
+              </span>
+            </p>
           </div>
         </div>
 
@@ -563,6 +808,27 @@ function App() {
             }}
           />
 
+          <div className="retro-viewtoggle" role="group" aria-label="Notes view">
+            <button
+              type="button"
+              className={`btn ${view === "notes" ? "btn-primary" : ""}`}
+              onClick={() => setView("notes")}
+              aria-pressed={view === "notes" ? "true" : "false"}
+              title="Show notes"
+            >
+              Notes ({notes.length})
+            </button>
+            <button
+              type="button"
+              className={`btn ${view === "trash" ? "btn-primary" : ""}`}
+              onClick={() => setView("trash")}
+              aria-pressed={view === "trash" ? "true" : "false"}
+              title="Show trash"
+            >
+              Trash ({trashedNotes.length})
+            </button>
+          </div>
+
           <button
             type="button"
             className="btn"
@@ -576,8 +842,12 @@ function App() {
             type="button"
             className="btn"
             onClick={exportNotesToJson}
-            disabled={notes.length === 0}
-            title={notes.length === 0 ? "No notes to export" : "Export notes to JSON"}
+            disabled={notes.length === 0 && trashedNotes.length === 0}
+            title={
+              notes.length === 0 && trashedNotes.length === 0
+                ? "No notes to export"
+                : "Export notes to JSON"
+            }
           >
             Export
           </button>
@@ -604,7 +874,7 @@ function App() {
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setQuery("");
                 }}
-                placeholder="Type to filter…"
+                placeholder={view === "trash" ? "Search trash…" : "Type to filter…"}
                 aria-describedby="search-help"
               />
               <button
@@ -618,84 +888,109 @@ function App() {
               </button>
             </div>
 
-            <div className="retro-sortbar" aria-label="Sorting options">
-              <label className="retro-label" htmlFor="sort">
-                Sort
-              </label>
-              <select
-                id="sort"
-                className="retro-input retro-select"
-                value={sortMode}
-                onChange={(e) => setSortMode(e.target.value)}
-                aria-label="Sort notes"
-              >
-                {SORT_MODES.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="retro-filterbar" aria-label="Tag filters">
-              <div className="retro-filterbar__row">
-                <span className="retro-filterbar__label">Tags</span>
-                <button
-                  type="button"
-                  className="btn retro-filterbar__clear"
-                  onClick={() => setActiveTag("")}
-                  disabled={!normalizeTag(activeTag)}
-                  title="Clear tag filter"
+            {view === "notes" ? (
+              <div className="retro-sortbar" aria-label="Sorting options">
+                <label className="retro-label" htmlFor="sort">
+                  Sort
+                </label>
+                <select
+                  id="sort"
+                  className="retro-input retro-select"
+                  value={sortMode}
+                  onChange={(e) => setSortMode(e.target.value)}
+                  aria-label="Sort notes"
                 >
-                  Clear tag
-                </button>
+                  {SORT_MODES.map((m) => (
+                    <option key={m.value} value={m.value}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
               </div>
+            ) : null}
 
-              {allTags.length === 0 ? (
-                <div className="retro-filterbar__empty">No tags yet.</div>
-              ) : (
-                <div className="retro-tags" role="list">
-                  {allTags.map((t) => {
-                    const active = normalizeTag(activeTag) === normalizeTag(t);
-                    return (
-                      <button
-                        key={t}
-                        type="button"
-                        className={`retro-tag ${active ? "is-active" : ""}`}
-                        onClick={() => toggleActiveTag(t)}
-                        role="listitem"
-                        aria-pressed={active ? "true" : "false"}
-                        title={active ? "Remove filter" : `Filter by "${t}"`}
-                      >
-                        #{t}
-                      </button>
-                    );
-                  })}
+            {view === "notes" ? (
+              <div className="retro-filterbar" aria-label="Tag filters">
+                <div className="retro-filterbar__row">
+                  <span className="retro-filterbar__label">Tags</span>
+                  <button
+                    type="button"
+                    className="btn retro-filterbar__clear"
+                    onClick={() => setActiveTag("")}
+                    disabled={!normalizeTag(activeTag)}
+                    title="Clear tag filter"
+                  >
+                    Clear tag
+                  </button>
                 </div>
-              )}
-            </div>
+
+                {allTags.length === 0 ? (
+                  <div className="retro-filterbar__empty">No tags yet.</div>
+                ) : (
+                  <div className="retro-tags" role="list">
+                    {allTags.map((t) => {
+                      const active = normalizeTag(activeTag) === normalizeTag(t);
+                      return (
+                        <button
+                          key={t}
+                          type="button"
+                          className={`retro-tag ${active ? "is-active" : ""}`}
+                          onClick={() => toggleActiveTag(t)}
+                          role="listitem"
+                          aria-pressed={active ? "true" : "false"}
+                          title={active ? "Remove filter" : `Filter by "${t}"`}
+                        >
+                          #{t}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="retro-filterbar" aria-label="Trash actions">
+                <div className="retro-filterbar__row">
+                  <span className="retro-filterbar__label">Trash</span>
+                  <button
+                    type="button"
+                    className="btn btn-danger retro-filterbar__clear"
+                    onClick={emptyTrash}
+                    disabled={trashedNotes.length === 0}
+                    title={trashedNotes.length === 0 ? "Trash is empty" : "Permanently delete everything in Trash"}
+                  >
+                    Empty
+                  </button>
+                </div>
+                <div className="retro-filterbar__empty">
+                  Trash items can be restored or permanently deleted.
+                </div>
+              </div>
+            )}
 
             <div id="search-help" className="retro-search__meta" aria-live="polite">
-              {query.trim() || normalizeTag(activeTag)
+              {query.trim() || (view === "notes" && normalizeTag(activeTag))
                 ? `Showing ${resultsCount} of ${totalCount}`
                 : `Showing all ${totalCount}`}
-              {normalizeTag(activeTag) ? ` • TAG: ${normalizeTag(activeTag)}` : ""}
+              {view === "notes" && normalizeTag(activeTag)
+                ? ` • TAG: ${normalizeTag(activeTag)}`
+                : ""}
             </div>
           </div>
 
           <div className="retro-list" role="list">
-            {filteredNotesPinnedFirst.length === 0 ? (
+            {visibleNotesSorted.length === 0 ? (
               <div className="retro-empty" role="status">
                 No matches.
               </div>
             ) : (
-              filteredNotesPinnedFirst.map((n) => {
+              visibleNotesSorted.map((n) => {
                 const active = n.id === selectedId;
                 const preview =
                   (n.body || "")
                     .replace(/\s+/g, " ")
                     .trim()
                     .slice(0, 70) || "…";
+
                 const isPinned = Boolean(n.pinned);
                 const noteTags = (n.tags || []).map(normalizeTag).filter(Boolean);
 
@@ -706,18 +1001,24 @@ function App() {
                     role="listitem"
                     aria-current={active ? "true" : "false"}
                   >
-                    <button
-                      className="retro-note-card__pin"
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        togglePin(n.id);
-                      }}
-                      aria-label={isPinned ? "Unpin note" : "Pin note"}
-                      title={isPinned ? "Unpin note" : "Pin note"}
-                    >
-                      {isPinned ? "📌" : "📍"}
-                    </button>
+                    {view === "notes" ? (
+                      <button
+                        className="retro-note-card__pin"
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          togglePin(n.id);
+                        }}
+                        aria-label={isPinned ? "Unpin note" : "Pin note"}
+                        title={isPinned ? "Unpin note" : "Pin note"}
+                      >
+                        {isPinned ? "📌" : "📍"}
+                      </button>
+                    ) : (
+                      <div className="retro-note-card__pin" aria-hidden="true">
+                        🗑
+                      </div>
+                    )}
 
                     <button
                       className={`retro-note-card ${active ? "is-active" : ""}`}
@@ -728,12 +1029,16 @@ function App() {
                         {n.title || "Untitled"}
                       </div>
                       <div className="retro-note-card__meta">
-                        {formatDate(n.updatedAt)}
-                        {isPinned ? " • PINNED" : ""}
-                        {noteTags.length ? ` • ${noteTags.length} TAGS` : ""}
+                        {view === "trash"
+                          ? `Deleted: ${formatDate(n.deletedAt)}`
+                          : formatDate(n.updatedAt)}
+                        {view === "notes" && isPinned ? " • PINNED" : ""}
+                        {view === "notes" && noteTags.length
+                          ? ` • ${noteTags.length} TAGS`
+                          : ""}
                       </div>
 
-                      {noteTags.length ? (
+                      {view === "notes" && noteTags.length ? (
                         <div className="retro-note-card__tags" aria-label="Note tags">
                           {noteTags.slice(0, 3).map((t) => (
                             <span key={t} className="retro-tag-pill">
@@ -763,11 +1068,17 @@ function App() {
               <span className="retro-status">
                 {selectedNote ? (
                   <>
-                    Editing:{" "}
+                    {view === "trash" ? "In Trash:" : "Editing:"}{" "}
                     <strong className="retro-status__strong">
                       {selectedNote.title || "Untitled"}
                     </strong>
                   </>
+                ) : view === "trash" ? (
+                  emptyTrashState ? (
+                    "Trash is empty."
+                  ) : (
+                    "Select a trashed note."
+                  )
                 ) : emptyState ? (
                   "No notes yet."
                 ) : (
@@ -777,34 +1088,57 @@ function App() {
             </div>
 
             <div className="retro-toolbar__right">
-              <button
-                className="btn"
-                onClick={() => {
-                  if (!selectedNote) return;
-                  togglePin(selectedNote.id);
-                }}
-                disabled={!selectedNote}
-                title={selectedNote?.pinned ? "Unpin note" : "Pin note"}
-              >
-                {selectedNote?.pinned ? "Unpin" : "Pin"}
-              </button>
+              {view === "notes" ? (
+                <>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      if (!activeSelectedNote) return;
+                      togglePin(activeSelectedNote.id);
+                    }}
+                    disabled={!activeSelectedNote}
+                    title={activeSelectedNote?.pinned ? "Unpin note" : "Pin note"}
+                  >
+                    {activeSelectedNote?.pinned ? "Unpin" : "Pin"}
+                  </button>
 
-              <button
-                className="btn"
-                onClick={saveSelectedNote}
-                disabled={!selectedNote}
-                title="Save changes"
-              >
-                Save
-              </button>
-              <button
-                className="btn btn-danger"
-                onClick={deleteSelectedNote}
-                disabled={!selectedNote}
-                title="Delete note"
-              >
-                Delete
-              </button>
+                  <button
+                    className="btn"
+                    onClick={saveSelectedNote}
+                    disabled={!activeSelectedNote}
+                    title="Save changes"
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    onClick={moveSelectedNoteToTrash}
+                    disabled={!activeSelectedNote}
+                    title="Move note to Trash"
+                  >
+                    Delete
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className="btn"
+                    onClick={restoreSelectedNoteFromTrash}
+                    disabled={!trashSelectedNote}
+                    title="Restore note"
+                  >
+                    Restore
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    onClick={permanentlyDeleteSelectedTrashNote}
+                    disabled={!trashSelectedNote}
+                    title="Permanently delete note"
+                  >
+                    Delete forever
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -814,140 +1148,193 @@ function App() {
             </div>
           ) : null}
 
-          {selectedNote ? (
+          {view === "notes" ? (
+            activeSelectedNote ? (
+              <div className="retro-editor__form">
+                <div className="retro-field">
+                  <label className="retro-label" htmlFor="title">
+                    Title
+                  </label>
+                  <input
+                    id="title"
+                    ref={titleInputRef}
+                    className="retro-input retro-input--title"
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="Untitled"
+                  />
+                </div>
+
+                <div className="retro-field">
+                  <label className="retro-label" htmlFor="body">
+                    Note
+                  </label>
+                  <textarea
+                    id="body"
+                    className="retro-textarea"
+                    value={body}
+                    onChange={(e) => setBody(e.target.value)}
+                    placeholder="Write something…"
+                    rows={12}
+                  />
+                </div>
+
+                <div className="retro-field">
+                  <label className="retro-label" htmlFor="tags">
+                    Tags
+                  </label>
+
+                  <div className="retro-tags-editor" aria-label="Tags editor">
+                    <div
+                      className="retro-tags-editor__chips"
+                      aria-label="Selected note tags"
+                    >
+                      {(activeSelectedNote.tags || []).length === 0 ? (
+                        <span className="retro-tags-editor__empty">No tags assigned.</span>
+                      ) : (
+                        (activeSelectedNote.tags || []).map((t) => {
+                          const norm = normalizeTag(t);
+                          return (
+                            <span key={norm} className="retro-tag-chip">
+                              <span className="retro-tag-chip__text">#{norm}</span>
+                              <button
+                                type="button"
+                                className="retro-tag-chip__remove"
+                                onClick={() => removeTagFromSelectedNote(norm)}
+                                aria-label={`Remove tag ${norm}`}
+                                title={`Remove ${norm}`}
+                              >
+                                ×
+                              </button>
+                            </span>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    <form
+                      className="retro-tags-editor__form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        addTagsToSelectedNote(tagDraft);
+                      }}
+                    >
+                      <input
+                        id="tags"
+                        className="retro-input retro-tags-editor__input"
+                        value={tagDraft}
+                        onChange={(e) => setTagDraft(e.target.value)}
+                        placeholder="Add tags (comma-separated)…"
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") setTagDraft("");
+                        }}
+                        aria-describedby="tags-help"
+                      />
+                      <button
+                        type="submit"
+                        className="btn"
+                        disabled={!parseTagsInput(tagDraft).length}
+                        title="Add tags"
+                      >
+                        Add
+                      </button>
+                    </form>
+
+                    <div id="tags-help" className="retro-tags-editor__help">
+                      Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>,{" "}
+                      <kbd>todo</kbd>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="retro-footer">
+                  <div className="retro-hint">
+                    Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this
+                    browser (localStorage).
+                  </div>
+                  <div className="retro-timestamps">
+                    <span>
+                      Created: <strong>{formatDate(activeSelectedNote.createdAt)}</strong>
+                    </span>
+                    <span>
+                      Updated: <strong>{formatDate(activeSelectedNote.updatedAt)}</strong>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="retro-placeholder" role="status">
+                {emptyState ? (
+                  <>
+                    <div className="retro-placeholder__title">
+                      Your desktop is empty.
+                    </div>
+                    <div className="retro-placeholder__body">
+                      Create your first note to begin.
+                    </div>
+                    <button className="btn btn-primary" onClick={createNewNote}>
+                      + New note
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="retro-placeholder__title">Select a note to edit.</div>
+                    <div className="retro-placeholder__body">
+                      Pick one from the list on the left, or create a new note.
+                    </div>
+                    <button className="btn btn-primary" onClick={createNewNote}>
+                      + New note
+                    </button>
+                  </>
+                )}
+              </div>
+            )
+          ) : trashSelectedNote ? (
             <div className="retro-editor__form">
               <div className="retro-field">
-                <label className="retro-label" htmlFor="title">
-                  Title
-                </label>
-                <input
-                  id="title"
-                  ref={titleInputRef}
-                  className="retro-input retro-input--title"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  placeholder="Untitled"
-                />
+                <span className="retro-label">Title</span>
+                <div className="retro-readonly">{trashSelectedNote.title || "Untitled"}</div>
               </div>
 
               <div className="retro-field">
-                <label className="retro-label" htmlFor="body">
-                  Note
-                </label>
-                <textarea
-                  id="body"
-                  className="retro-textarea"
-                  value={body}
-                  onChange={(e) => setBody(e.target.value)}
-                  placeholder="Write something…"
-                  rows={12}
-                />
-              </div>
-
-              <div className="retro-field">
-                <label className="retro-label" htmlFor="tags">
-                  Tags
-                </label>
-
-                <div className="retro-tags-editor" aria-label="Tags editor">
-                  <div className="retro-tags-editor__chips" aria-label="Selected note tags">
-                    {(selectedNote.tags || []).length === 0 ? (
-                      <span className="retro-tags-editor__empty">No tags assigned.</span>
-                    ) : (
-                      (selectedNote.tags || []).map((t) => {
-                        const norm = normalizeTag(t);
-                        return (
-                          <span key={norm} className="retro-tag-chip">
-                            <span className="retro-tag-chip__text">#{norm}</span>
-                            <button
-                              type="button"
-                              className="retro-tag-chip__remove"
-                              onClick={() => removeTagFromSelectedNote(norm)}
-                              aria-label={`Remove tag ${norm}`}
-                              title={`Remove ${norm}`}
-                            >
-                              ×
-                            </button>
-                          </span>
-                        );
-                      })
-                    )}
-                  </div>
-
-                  <form
-                    className="retro-tags-editor__form"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      addTagsToSelectedNote(tagDraft);
-                    }}
-                  >
-                    <input
-                      id="tags"
-                      className="retro-input retro-tags-editor__input"
-                      value={tagDraft}
-                      onChange={(e) => setTagDraft(e.target.value)}
-                      placeholder="Add tags (comma-separated)…"
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape") setTagDraft("");
-                      }}
-                      aria-describedby="tags-help"
-                    />
-                    <button
-                      type="submit"
-                      className="btn"
-                      disabled={!parseTagsInput(tagDraft).length}
-                      title="Add tags"
-                    >
-                      Add
-                    </button>
-                  </form>
-
-                  <div id="tags-help" className="retro-tags-editor__help">
-                    Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>, <kbd>todo</kbd>
-                  </div>
+                <span className="retro-label">Note</span>
+                <div className="retro-readonly retro-readonly--body">
+                  {trashSelectedNote.body || "…"}
                 </div>
               </div>
 
               <div className="retro-footer">
                 <div className="retro-hint">
-                  Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this
-                  browser (localStorage).
+                  Trash is read-only. Restore to edit again.
                 </div>
                 <div className="retro-timestamps">
                   <span>
-                    Created: <strong>{formatDate(selectedNote.createdAt)}</strong>
+                    Created: <strong>{formatDate(trashSelectedNote.createdAt)}</strong>
                   </span>
                   <span>
-                    Updated: <strong>{formatDate(selectedNote.updatedAt)}</strong>
+                    Deleted: <strong>{formatDate(trashSelectedNote.deletedAt)}</strong>
                   </span>
                 </div>
               </div>
             </div>
           ) : (
             <div className="retro-placeholder" role="status">
-              {emptyState ? (
+              {emptyTrashState ? (
                 <>
-                  <div className="retro-placeholder__title">
-                    Your desktop is empty.
-                  </div>
+                  <div className="retro-placeholder__title">Trash is empty.</div>
                   <div className="retro-placeholder__body">
-                    Create your first note to begin.
+                    Deleted notes appear here until you restore them or delete forever.
                   </div>
-                  <button className="btn btn-primary" onClick={createNewNote}>
-                    + New note
+                  <button className="btn" onClick={() => setView("notes")}>
+                    Back to Notes
                   </button>
                 </>
               ) : (
                 <>
-                  <div className="retro-placeholder__title">
-                    Select a note to edit.
-                  </div>
+                  <div className="retro-placeholder__title">Select a trashed note.</div>
                   <div className="retro-placeholder__body">
-                    Pick one from the list on the left, or create a new note.
+                    Restore it, or delete it forever.
                   </div>
-                  <button className="btn btn-primary" onClick={createNewNote}>
-                    + New note
-                  </button>
                 </>
               )}
             </div>
@@ -959,9 +1346,9 @@ function App() {
         <div className="retro-footerbar__left">
           <span className="retro-pip" aria-hidden="true" />
           <span>
-            Notes:{" "}
+            {view === "trash" ? "Trash" : "Notes"}:{" "}
             <strong>
-              {query.trim() || normalizeTag(activeTag)
+              {query.trim() || (view === "notes" && normalizeTag(activeTag))
                 ? `${resultsCount} / ${totalCount}`
                 : totalCount}
             </strong>

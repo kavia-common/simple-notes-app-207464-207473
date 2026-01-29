@@ -1189,6 +1189,32 @@ kbd {
   color: rgba(15, 23, 42, 0.60);
 }
 
+/* Reminders UI (compact, retro-friendly) */
+.retro-reminder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(86, 247, 212, 0.16);
+  background: rgba(7, 8, 18, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14);
+}
+
+.App[data-theme="light"] .retro-reminder {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.06);
+}
+
+.retro-reminder__input {
+  width: 220px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
 .retro-mono {
   font-family: var(--mono);
   letter-spacing: 0.08em;

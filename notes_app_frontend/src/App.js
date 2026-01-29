@@ -3,6 +3,15 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DOMPurify from "dompurify";
 import CommandPalette from "./components/CommandPalette";
+import {
+  cancelReminder,
+  getNotificationPermission,
+  getReminderForNote,
+  notificationsSupported,
+  requestNotificationPermission,
+  rescheduleAllReminders,
+  scheduleReminder,
+} from "./utils/reminders";
 import "./App.css";
 
 /**
@@ -32,6 +41,7 @@ const THEME_KEY = "retro_notes_theme_v1";
  * @property {boolean} pinned
  * @property {string[]} tags
  * @property {number=} deletedAt
+ * @property {number=} reminderAt
  */
 
 /**
@@ -138,6 +148,9 @@ function normalizeNote(raw) {
   // Soft delete timestamp (if present).
   const deletedAt = Number.isFinite(raw.deletedAt) ? raw.deletedAt : undefined;
 
+  // Reminder timestamp (if present).
+  const reminderAt = Number.isFinite(raw.reminderAt) ? raw.reminderAt : undefined;
+
   return {
     id,
     title: typeof raw.title === "string" ? raw.title : "",
@@ -147,6 +160,7 @@ function normalizeNote(raw) {
     pinned: Boolean(raw.pinned),
     tags,
     deletedAt,
+    reminderAt,
   };
 }
 
@@ -289,6 +303,12 @@ function App() {
   const [tagDraft, setTagDraft] = useState("");
 
   const [error, setError] = useState("");
+
+  // Notifications permission state (for UI display).
+  const [notifPermission, setNotifPermission] = useState(() =>
+    getNotificationPermission()
+  );
+
   const titleInputRef = useRef(null);
   const importInputRef = useRef(null);
 
@@ -420,6 +440,29 @@ function App() {
     }
   }, [sortMode]);
 
+  // Keep notification permission state in sync (user may change it in browser UI).
+  useEffect(() => {
+    function syncPermission() {
+      setNotifPermission(getNotificationPermission());
+    }
+
+    syncPermission();
+
+    window.addEventListener("focus", syncPermission);
+    document.addEventListener("visibilitychange", syncPermission);
+    return () => {
+      window.removeEventListener("focus", syncPermission);
+      document.removeEventListener("visibilitychange", syncPermission);
+    };
+  }, []);
+
+  // Reschedule persisted reminders whenever the note set changes.
+  // (Reminders are stored separately; this keeps scheduling aligned and drops orphaned reminders.)
+  useEffect(() => {
+    const ids = new Set([...notes, ...trashedNotes].map((n) => n.id));
+    rescheduleAllReminders({ existingNoteIds: ids });
+  }, [notes, trashedNotes]);
+
   const activeSelectedNote = useMemo(() => {
     if (!selectedId) return null;
     return notes.find((n) => n.id === selectedId) || null;
@@ -536,6 +579,7 @@ function App() {
       updatedAt: now,
       pinned: false,
       tags: [],
+      reminderAt: undefined,
     };
 
     setNotes((prev) => [newNote, ...prev].sort(sortNotesPinnedFirst));
@@ -603,6 +647,9 @@ function App() {
       return;
     }
 
+    // Reminders should not fire for trashed notes.
+    cancelReminder(activeSelectedNote.id);
+
     const ok = window.confirm(
       `Move "${activeSelectedNote.title || "Untitled"}" to Trash?`
     );
@@ -622,6 +669,7 @@ function App() {
         ...activeSelectedNote,
         pinned: false,
         deletedAt,
+        reminderAt: undefined,
       };
       // Avoid duplicates if somehow already in trash
       const filtered = prev.filter((n) => n.id !== trashedCopy.id);
@@ -677,6 +725,8 @@ function App() {
       return;
     }
 
+    cancelReminder(trashSelectedNote.id);
+
     const ok = window.confirm(
       `Permanently delete "${trashSelectedNote.title || "Untitled"}"? This cannot be undone.`
     );
@@ -702,6 +752,82 @@ function App() {
 
     setTrashedNotes([]);
     setSelectedId(null);
+  }
+
+  // PUBLIC_INTERFACE
+  async function ensureNotificationPermission() {
+    /** Request notification permission if needed, and sync state. */
+    setError("");
+
+    if (!notificationsSupported()) {
+      setError("Notifications are not supported in this browser.");
+      return false;
+    }
+
+    const current = getNotificationPermission();
+    if (current === "granted") return true;
+
+    const res = await requestNotificationPermission();
+    setNotifPermission(res);
+
+    if (res !== "granted") {
+      setError("Notifications permission was not granted. Reminder not set.");
+      return false;
+    }
+    return true;
+  }
+
+  // PUBLIC_INTERFACE
+  function setReminderForSelectedNote(remindAtMs) {
+    /** Schedule a reminder for the selected note (Notes view only). */
+    setError("");
+
+    if (view !== "notes") {
+      setError("Set reminders from Notes (Trash is read-only).");
+      return;
+    }
+    if (!activeSelectedNote) {
+      setError("No note selected.");
+      return;
+    }
+    if (!Number.isFinite(remindAtMs) || remindAtMs <= Date.now()) {
+      setError("Pick a future time for the reminder.");
+      return;
+    }
+
+    // Keep reminder timestamp on the note for UI + export/import persistence.
+    setNotes((prev) => {
+      const next = prev.map((n) =>
+        n.id === activeSelectedNote.id ? { ...n, reminderAt: remindAtMs } : n
+      );
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    // Use Notifications scheduler (will persist + schedule timeout if permission granted).
+    scheduleReminder(
+      { id: activeSelectedNote.id, title, body },
+      remindAtMs
+    );
+  }
+
+  // PUBLIC_INTERFACE
+  function clearReminderForSelectedNote() {
+    /** Cancel reminder for selected note. */
+    setError("");
+
+    if (view !== "notes") return;
+    if (!activeSelectedNote) return;
+
+    setNotes((prev) => {
+      const next = prev.map((n) =>
+        n.id === activeSelectedNote.id ? { ...n, reminderAt: undefined } : n
+      );
+      next.sort(sortNotesPinnedFirst);
+      return next;
+    });
+
+    cancelReminder(activeSelectedNote.id);
   }
 
   // PUBLIC_INTERFACE
@@ -1499,6 +1625,103 @@ function App() {
             <div className="retro-toolbar__right">
               {view === "notes" ? (
                 <>
+                  {/* Reminders */}
+                  <div className="retro-reminder" role="group" aria-label="Reminders">
+                    {notificationsSupported() ? (
+                      notifPermission !== "granted" ? (
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={ensureNotificationPermission}
+                          title={
+                            notifPermission === "denied"
+                              ? "Notifications are blocked in browser settings"
+                              : "Enable notifications for reminders"
+                          }
+                        >
+                          Enable reminders
+                        </button>
+                      ) : null
+                    ) : (
+                      <button type="button" className="btn" disabled title="Not supported">
+                        Reminders unsupported
+                      </button>
+                    )}
+
+                    <input
+                      type="datetime-local"
+                      className="retro-input retro-reminder__input"
+                      disabled={
+                        !activeSelectedNote ||
+                        !notificationsSupported() ||
+                        notifPermission !== "granted"
+                      }
+                      value={(() => {
+                        const r =
+                          activeSelectedNote?.reminderAt ||
+                          getReminderForNote(activeSelectedNote?.id)?.remindAt;
+                        if (!r) return "";
+                        try {
+                          const d = new Date(r);
+                          const pad = (n) => String(n).padStart(2, "0");
+                          // datetime-local expects local time without seconds
+                          return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+                            d.getDate()
+                          )}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                        } catch {
+                          return "";
+                        }
+                      })()}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (!v) return;
+                        const ms = new Date(v).getTime();
+                        // Store draft on note immediately? We set only on explicit "Set" for clarity.
+                        // (No-op here.)
+                        if (!Number.isFinite(ms)) return;
+                      }}
+                      onBlur={(e) => {
+                        // No-op: we rely on Set button to schedule.
+                      }}
+                      aria-label="Reminder time"
+                      title="Pick a reminder time"
+                    />
+
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={
+                        !activeSelectedNote ||
+                        !notificationsSupported() ||
+                        notifPermission !== "granted"
+                      }
+                      onClick={() => {
+                        if (!activeSelectedNote) return;
+                        const input = document.querySelector(".retro-reminder__input");
+                        const value = input?.value;
+                        if (!value) {
+                          setError("Pick a reminder time first.");
+                          return;
+                        }
+                        const ms = new Date(value).getTime();
+                        setReminderForSelectedNote(ms);
+                      }}
+                      title="Schedule reminder"
+                    >
+                      Set reminder
+                    </button>
+
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      disabled={!activeSelectedNote || !getReminderForNote(activeSelectedNote?.id)}
+                      onClick={clearReminderForSelectedNote}
+                      title="Cancel reminder"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
                   <button
                     className="btn"
                     onClick={() => {

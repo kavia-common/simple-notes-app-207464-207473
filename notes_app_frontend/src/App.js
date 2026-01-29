@@ -175,6 +175,30 @@ function makeExportFileName() {
 
 /** @typedef {"notes"|"trash"} AppView */
 
+/**
+ * Determine whether a global shortcut should fire given the key event.
+ * We avoid hijacking common typing/editing interactions in form fields.
+ */
+function shouldIgnoreGlobalShortcut(e) {
+  // If the user is composing with an IME (Japanese/Chinese/etc.), don't interfere.
+  if (e.isComposing) return true;
+
+  const t = e.target;
+  if (!t || !(t instanceof HTMLElement)) return false;
+
+  // Contenteditable or explicit opt-out:
+  if (t.isContentEditable) return true;
+  if (t.closest("[data-hotkeys='off']")) return true;
+
+  const tag = (t.tagName || "").toLowerCase();
+
+  // If focus is in any text input control, ignore most shortcuts.
+  // We still allow Escape via existing per-input handlers.
+  if (tag === "input" || tag === "textarea" || tag === "select") return true;
+
+  return false;
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /** @type {[Note[], Function]} */
@@ -202,6 +226,9 @@ function App() {
   const [error, setError] = useState("");
   const titleInputRef = useRef(null);
   const importInputRef = useRef(null);
+
+  // Keyboard shortcut focus targets.
+  const searchInputRef = useRef(null);
 
   // Load from localStorage once.
   useEffect(() => {
@@ -760,6 +787,105 @@ function App() {
     }
   }
 
+  /**
+   * Install global keyboard shortcuts.
+   *
+   * Shortcuts:
+   * - Ctrl/Cmd + N: New note
+   * - Ctrl/Cmd + K or / : Focus search
+   * - Ctrl/Cmd + 1: Notes view
+   * - Ctrl/Cmd + 2: Trash view
+   * - Delete / Backspace (when not typing): Move selected note to trash (Notes) / delete forever (Trash)
+   * - R (Trash): Restore selected note
+   * - Esc (global): Clear search if not already handled by focused input; otherwise do nothing.
+   */
+  useEffect(() => {
+    function onKeyDown(e) {
+      // Ignore if user is actively typing in an input/textarea/select/contenteditable.
+      const ignore = shouldIgnoreGlobalShortcut(e);
+
+      const key = String(e.key || "");
+      const lower = key.toLowerCase();
+      const metaOrCtrl = e.metaKey || e.ctrlKey;
+
+      // Always allow browser/system shortcuts like reload, devtools, etc.
+      // We only preventDefault when we actually handle something.
+      if (metaOrCtrl && lower === "n" && !ignore) {
+        e.preventDefault();
+        createNewNote();
+        return;
+      }
+
+      // Focus search: Ctrl/Cmd+K is common; also support "/" when not typing.
+      if (
+        ((metaOrCtrl && lower === "k") || (!metaOrCtrl && lower === "/")) &&
+        !ignore
+      ) {
+        e.preventDefault();
+        setTimeout(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select?.();
+        }, 0);
+        return;
+      }
+
+      // Toggle views
+      if (metaOrCtrl && (lower === "1" || lower === "2") && !ignore) {
+        e.preventDefault();
+        setView(lower === "1" ? "notes" : "trash");
+        return;
+      }
+
+      // Delete shortcut when NOT typing
+      if ((key === "Delete" || key === "Backspace") && !ignore) {
+        // In Notes: delete -> move to trash
+        if (view === "notes") {
+          if (!activeSelectedNote) return;
+          e.preventDefault();
+          moveSelectedNoteToTrash();
+          return;
+        }
+
+        // In Trash: delete -> permanent delete
+        if (view === "trash") {
+          if (!trashSelectedNote) return;
+          e.preventDefault();
+          permanentlyDeleteSelectedTrashNote();
+          return;
+        }
+      }
+
+      // Restore in trash (R)
+      if (view === "trash" && lower === "r" && !ignore) {
+        if (!trashSelectedNote) return;
+        e.preventDefault();
+        restoreSelectedNoteFromTrash();
+        return;
+      }
+
+      // Global escape: if not in an input, clear the search (matches user expectation).
+      if (key === "Escape" && !ignore) {
+        if (query.trim()) {
+          e.preventDefault();
+          setQuery("");
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    view,
+    query,
+    activeSelectedNote,
+    trashSelectedNote,
+    // actions
+    createNewNote,
+    moveSelectedNoteToTrash,
+    permanentlyDeleteSelectedTrashNote,
+    restoreSelectedNoteFromTrash,
+  ]);
+
   function formatDate(ms) {
     try {
       return new Date(ms).toLocaleString(undefined, {
@@ -867,6 +993,7 @@ function App() {
 
             <div className="retro-search">
               <input
+                ref={searchInputRef}
                 id="search"
                 className="retro-input retro-search__input"
                 value={query}
@@ -956,7 +1083,11 @@ function App() {
                     className="btn btn-danger retro-filterbar__clear"
                     onClick={emptyTrash}
                     disabled={trashedNotes.length === 0}
-                    title={trashedNotes.length === 0 ? "Trash is empty" : "Permanently delete everything in Trash"}
+                    title={
+                      trashedNotes.length === 0
+                        ? "Trash is empty"
+                        : "Permanently delete everything in Trash"
+                    }
                   >
                     Empty
                   </button>
@@ -1025,17 +1156,13 @@ function App() {
                       onClick={() => setSelectedId(n.id)}
                       type="button"
                     >
-                      <div className="retro-note-card__title">
-                        {n.title || "Untitled"}
-                      </div>
+                      <div className="retro-note-card__title">{n.title || "Untitled"}</div>
                       <div className="retro-note-card__meta">
                         {view === "trash"
                           ? `Deleted: ${formatDate(n.deletedAt)}`
                           : formatDate(n.updatedAt)}
                         {view === "notes" && isPinned ? " • PINNED" : ""}
-                        {view === "notes" && noteTags.length
-                          ? ` • ${noteTags.length} TAGS`
-                          : ""}
+                        {view === "notes" && noteTags.length ? ` • ${noteTags.length} TAGS` : ""}
                       </div>
 
                       {view === "notes" && noteTags.length ? (
@@ -1185,10 +1312,7 @@ function App() {
                   </label>
 
                   <div className="retro-tags-editor" aria-label="Tags editor">
-                    <div
-                      className="retro-tags-editor__chips"
-                      aria-label="Selected note tags"
-                    >
+                    <div className="retro-tags-editor__chips" aria-label="Selected note tags">
                       {(activeSelectedNote.tags || []).length === 0 ? (
                         <span className="retro-tags-editor__empty">No tags assigned.</span>
                       ) : (
@@ -1241,16 +1365,15 @@ function App() {
                     </form>
 
                     <div id="tags-help" className="retro-tags-editor__help">
-                      Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>,{" "}
-                      <kbd>todo</kbd>
+                      Tip: Use commas. Example: <kbd>work</kbd>, <kbd>ideas</kbd>, <kbd>todo</kbd>
                     </div>
                   </div>
                 </div>
 
                 <div className="retro-footer">
                   <div className="retro-hint">
-                    Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this
-                    browser (localStorage).
+                    Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this browser
+                    (localStorage).
                   </div>
                   <div className="retro-timestamps">
                     <span>
@@ -1266,12 +1389,8 @@ function App() {
               <div className="retro-placeholder" role="status">
                 {emptyState ? (
                   <>
-                    <div className="retro-placeholder__title">
-                      Your desktop is empty.
-                    </div>
-                    <div className="retro-placeholder__body">
-                      Create your first note to begin.
-                    </div>
+                    <div className="retro-placeholder__title">Your desktop is empty.</div>
+                    <div className="retro-placeholder__body">Create your first note to begin.</div>
                     <button className="btn btn-primary" onClick={createNewNote}>
                       + New note
                     </button>
@@ -1298,15 +1417,11 @@ function App() {
 
               <div className="retro-field">
                 <span className="retro-label">Note</span>
-                <div className="retro-readonly retro-readonly--body">
-                  {trashSelectedNote.body || "…"}
-                </div>
+                <div className="retro-readonly retro-readonly--body">{trashSelectedNote.body || "…"}</div>
               </div>
 
               <div className="retro-footer">
-                <div className="retro-hint">
-                  Trash is read-only. Restore to edit again.
-                </div>
+                <div className="retro-hint">Trash is read-only. Restore to edit again.</div>
                 <div className="retro-timestamps">
                   <span>
                     Created: <strong>{formatDate(trashSelectedNote.createdAt)}</strong>
@@ -1332,9 +1447,7 @@ function App() {
               ) : (
                 <>
                   <div className="retro-placeholder__title">Select a trashed note.</div>
-                  <div className="retro-placeholder__body">
-                    Restore it, or delete it forever.
-                  </div>
+                  <div className="retro-placeholder__body">Restore it, or delete it forever.</div>
                 </>
               )}
             </div>
@@ -1354,8 +1467,21 @@ function App() {
             </strong>
           </span>
         </div>
+
         <div className="retro-footerbar__right">
-          <span className="retro-mono">LOCAL • OFFLINE • NO BACKEND</span>
+          <span className="retro-mono">
+            <kbd>Ctrl/⌘</kbd>+<kbd>N</kbd> new • <kbd>Ctrl/⌘</kbd>+<kbd>K</kbd> search •{" "}
+            <kbd>Ctrl/⌘</kbd>+<kbd>1</kbd>/<kbd>2</kbd> views •{" "}
+            {view === "trash" ? (
+              <>
+                <kbd>R</kbd> restore • <kbd>Del</kbd> delete
+              </>
+            ) : (
+              <>
+                <kbd>Del</kbd> trash
+              </>
+            )}
+          </span>
         </div>
       </footer>
     </div>

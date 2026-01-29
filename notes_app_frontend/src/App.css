@@ -627,6 +627,188 @@
   color: var(--text);
 }
 
+/* Autosave indicator */
+.retro-autosave {
+  margin-left: 8px;
+}
+
+.retro-autosave__pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border: 1px solid rgba(86, 247, 212, 0.18);
+  background: rgba(7, 8, 18, 0.30);
+  color: rgba(240, 255, 250, 0.78);
+}
+
+.App[data-theme="light"] .retro-autosave__pill {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.55);
+  color: rgba(15, 23, 42, 0.68);
+}
+
+.retro-autosave__pill.is-saved {
+  border-color: rgba(86, 247, 212, 0.30);
+  color: rgba(240, 255, 250, 0.82);
+}
+
+.App[data-theme="light"] .retro-autosave__pill.is-saved {
+  border-color: rgba(14, 165, 233, 0.25);
+  color: rgba(15, 23, 42, 0.72);
+}
+
+.retro-autosave__pill.is-unsaved {
+  border-color: rgba(124, 92, 255, 0.32);
+  background: rgba(124, 92, 255, 0.10);
+  color: rgba(240, 255, 250, 0.86);
+}
+
+.App[data-theme="light"] .retro-autosave__pill.is-unsaved {
+  border-color: rgba(124, 58, 237, 0.22);
+  background: rgba(124, 58, 237, 0.08);
+  color: rgba(15, 23, 42, 0.78);
+}
+
+.retro-autosave__pill.is-saving {
+  border-color: rgba(86, 247, 212, 0.40);
+  background: rgba(86, 247, 212, 0.08);
+  color: rgba(240, 255, 250, 0.88);
+}
+
+.App[data-theme="light"] .retro-autosave__pill.is-saving {
+  border-color: rgba(14, 165, 233, 0.28);
+  background: rgba(14, 165, 233, 0.08);
+}
+
+.retro-autosave__pill.is-error {
+  border-color: rgba(255, 59, 122, 0.38);
+  background: rgba(255, 59, 122, 0.10);
+  color: rgba(255, 232, 242, 0.95);
+}
+
+.App[data-theme="light"] .retro-autosave__pill.is-error {
+  border-color: rgba(239, 68, 68, 0.28);
+  background: rgba(239, 68, 68, 0.08);
+  color: rgba(127, 29, 29, 0.92);
+}
+
+/* Version history panel */
+.retro-history {
+  margin: 14px 14px 0;
+  border-radius: 14px;
+  border: 1px solid rgba(86, 247, 212, 0.14);
+  background: rgba(7, 8, 18, 0.26);
+  padding: 12px;
+}
+
+.App[data-theme="light"] .retro-history {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.retro-history__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed rgba(86, 247, 212, 0.16);
+  margin-bottom: 10px;
+}
+
+.App[data-theme="light"] .retro-history__head {
+  border-bottom-color: rgba(15, 23, 42, 0.14);
+}
+
+.retro-history__title {
+  font-family: var(--mono);
+  letter-spacing: 0.10em;
+  font-weight: 800;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: rgba(240, 255, 250, 0.82);
+}
+
+.App[data-theme="light"] .retro-history__title {
+  color: rgba(15, 23, 42, 0.74);
+}
+
+.retro-history__actions {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.retro-history__empty {
+  padding: 10px 8px;
+  color: rgba(240, 255, 250, 0.68);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.App[data-theme="light"] .retro-history__empty {
+  color: rgba(15, 23, 42, 0.62);
+}
+
+.retro-history__list {
+  display: grid;
+  gap: 10px;
+}
+
+.retro-history__item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(86, 247, 212, 0.12);
+  background: rgba(7, 8, 18, 0.30);
+}
+
+.App[data-theme="light"] .retro-history__item {
+  border-color: rgba(15, 23, 42, 0.10);
+  background: rgba(2, 6, 23, 0.02);
+}
+
+.retro-history__when {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: rgba(240, 255, 250, 0.66);
+}
+
+.App[data-theme="light"] .retro-history__when {
+  color: rgba(15, 23, 42, 0.58);
+}
+
+.retro-history__label {
+  font-weight: 800;
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.retro-history__preview {
+  font-size: 12px;
+  color: rgba(240, 255, 250, 0.75);
+  line-height: 1.35;
+}
+
+.App[data-theme="light"] .retro-history__preview {
+  color: rgba(15, 23, 42, 0.66);
+}
+
+.retro-history__btns {
+  display: inline-flex;
+  gap: 8px;
+  align-items: start;
+}
+
 .retro-editor__form {
   padding: 14px;
   display: grid;

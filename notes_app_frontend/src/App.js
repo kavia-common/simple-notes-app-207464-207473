@@ -12,6 +12,11 @@ import {
   rescheduleAllReminders,
   scheduleReminder,
 } from "./utils/reminders";
+import {
+  addNoteSnapshot,
+  getNoteSnapshots,
+  clearNoteSnapshots,
+} from "./utils/versionHistory";
 import "./App.css";
 
 /**
@@ -247,7 +252,12 @@ function isSafeUrl(url) {
   if (!raw) return false;
 
   // Allow hash links and relative paths.
-  if (raw.startsWith("#") || raw.startsWith("/") || raw.startsWith("./") || raw.startsWith("../")) {
+  if (
+    raw.startsWith("#") ||
+    raw.startsWith("/") ||
+    raw.startsWith("./") ||
+    raw.startsWith("../")
+  ) {
     return true;
   }
 
@@ -255,7 +265,12 @@ function isSafeUrl(url) {
   try {
     const parsed = new URL(raw);
     const protocol = parsed.protocol.toLowerCase();
-    return protocol === "http:" || protocol === "https:" || protocol === "mailto:" || protocol === "tel:";
+    return (
+      protocol === "http:" ||
+      protocol === "https:" ||
+      protocol === "mailto:" ||
+      protocol === "tel:"
+    );
   } catch {
     // If URL constructor fails, treat as unsafe.
     return false;
@@ -269,6 +284,15 @@ function sanitizeHtml(html) {
     FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "link", "meta"],
     FORBID_ATTR: ["style", "onerror", "onload", "onclick", "onmouseover"],
   });
+}
+
+function safeTrimEnd(text) {
+  return String(text || "").trimEnd();
+}
+
+function normalizeForCompare(text) {
+  // Treat trailing whitespace as not meaningful for change detection.
+  return safeTrimEnd(text);
 }
 
 // PUBLIC_INTERFACE
@@ -308,6 +332,24 @@ function App() {
   const [notifPermission, setNotifPermission] = useState(() =>
     getNotificationPermission()
   );
+
+  // Autosave indicator state.
+  /** @typedef {"saved"|"unsaved"|"saving"|"error"} AutosaveStatus */
+  /** @type {[AutosaveStatus, Function]} */
+  const [autosaveStatus, setAutosaveStatus] = useState("saved");
+  const [autosaveMessage, setAutosaveMessage] = useState("");
+  const [lastAutosavedAt, setLastAutosavedAt] = useState(0);
+
+  // Version history UI state (per selected note).
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [historyItems, setHistoryItems] = useState([]);
+
+  // Used to debounce autosave and avoid applying stale timers after switching notes.
+  const autosaveTimerRef = useRef(null);
+  const autosaveTokenRef = useRef(0);
+
+  // Used to detect "unsaved changes" against the currently persisted note.
+  const lastPersistedRef = useRef({ noteId: "", title: "", body: "" });
 
   const titleInputRef = useRef(null);
   const importInputRef = useRef(null);
@@ -417,6 +459,8 @@ function App() {
     } catch (e) {
       console.error("Failed to persist notes:", e);
       setError("Storage is full or unavailable. Changes may not persist.");
+      setAutosaveStatus("error");
+      setAutosaveMessage("Storage error");
     }
   }, [notes]);
 
@@ -523,10 +567,22 @@ function App() {
     // This preserves the "type and save" workflow and avoids landing in Preview unexpectedly.
     setEditorMode("edit");
 
+    // Cancel any pending autosave when switching notes/views.
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    autosaveTokenRef.current += 1;
+
     if (view === "trash") {
       setTitle("");
       setBody("");
       setTagDraft("");
+      setAutosaveStatus("saved");
+      setAutosaveMessage("");
+      setIsHistoryOpen(false);
+      setHistoryItems([]);
+      lastPersistedRef.current = { noteId: "", title: "", body: "" };
       return;
     }
 
@@ -534,11 +590,29 @@ function App() {
       setTitle("");
       setBody("");
       setTagDraft("");
+      setAutosaveStatus("saved");
+      setAutosaveMessage("");
+      setIsHistoryOpen(false);
+      setHistoryItems([]);
+      lastPersistedRef.current = { noteId: "", title: "", body: "" };
       return;
     }
+
     setTitle(activeSelectedNote.title);
     setBody(activeSelectedNote.body);
     setTagDraft("");
+
+    // Reset autosave baseline to the persisted note values.
+    lastPersistedRef.current = {
+      noteId: activeSelectedNote.id,
+      title: normalizeForCompare(activeSelectedNote.title),
+      body: normalizeForCompare(activeSelectedNote.body),
+    };
+    setAutosaveStatus("saved");
+    setAutosaveMessage("All changes saved");
+
+    // Load history list for UI (when opened, it will re-sync as well).
+    setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
   }, [activeSelectedNote, view]);
 
   // When switching views, ensure selectedId belongs to current list.
@@ -586,12 +660,141 @@ function App() {
     setView("notes");
     setSelectedId(newNote.id);
 
+    // Ensure the history starts with an initial snapshot (useful for "restore").
+    try {
+      addNoteSnapshot(newNote);
+      setHistoryItems(getNoteSnapshots(newNote.id));
+    } catch {
+      // non-fatal
+    }
+
     // Focus title input next tick.
     setTimeout(() => {
       titleInputRef.current?.focus();
       titleInputRef.current?.select?.();
     }, 0);
   }
+
+  function currentDraftIsDifferentFromPersisted() {
+    if (view !== "notes") return false;
+    if (!activeSelectedNote) return false;
+
+    const baseline = lastPersistedRef.current;
+    if (!baseline || baseline.noteId !== activeSelectedNote.id) return true;
+
+    const t = normalizeForCompare(title);
+    const b = normalizeForCompare(body);
+    return t !== baseline.title || b !== baseline.body;
+  }
+
+  function setAutosaveUiStateForDraft() {
+    const dirty = currentDraftIsDifferentFromPersisted();
+    if (dirty) {
+      setAutosaveStatus("unsaved");
+      setAutosaveMessage("Unsaved changes");
+    } else {
+      setAutosaveStatus("saved");
+      setAutosaveMessage("All changes saved");
+    }
+  }
+
+  // Autosave: mark as dirty on draft changes and schedule a debounced save.
+  useEffect(() => {
+    if (view !== "notes") return;
+    if (!activeSelectedNote) return;
+
+    // If the draft matches persisted baseline, reflect "saved".
+    setAutosaveUiStateForDraft();
+
+    // Only schedule autosave if draft is actually different.
+    const dirty = currentDraftIsDifferentFromPersisted();
+    if (!dirty) return;
+
+    const token = (autosaveTokenRef.current += 1);
+
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+
+    autosaveTimerRef.current = setTimeout(() => {
+      // If a newer autosave has been scheduled, do nothing.
+      if (token !== autosaveTokenRef.current) return;
+
+      // Re-check dirty state at execution time.
+      if (!currentDraftIsDifferentFromPersisted()) {
+        setAutosaveStatus("saved");
+        setAutosaveMessage("All changes saved");
+        return;
+      }
+
+      // Autosave should not create empty notes (mirror manual save constraint).
+      const trimmedTitle = title.trim();
+      const trimmedBody = body.trimEnd();
+      if (!trimmedTitle && !trimmedBody) {
+        setAutosaveStatus("unsaved");
+        setAutosaveMessage("Not saved (note is empty)");
+        return;
+      }
+
+      setAutosaveStatus("saving");
+      setAutosaveMessage("Saving…");
+
+      const now = Date.now();
+      const nextTitle = trimmedTitle || "Untitled";
+
+      try {
+        // 1) Update note in state (persisted via existing notes effect).
+        setNotes((prev) => {
+          const updated = prev.map((n) =>
+            n.id === activeSelectedNote.id
+              ? {
+                  ...n,
+                  title: nextTitle,
+                  body: trimmedBody,
+                  updatedAt: now,
+                }
+              : n
+          );
+          updated.sort(sortNotesPinnedFirst);
+          return updated;
+        });
+
+        // 2) Add snapshot (version history) on autosave boundary.
+        try {
+          addNoteSnapshot({ id: activeSelectedNote.id, title: nextTitle, body: trimmedBody });
+          if (isHistoryOpen) {
+            setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+          }
+        } catch {
+          // ignore snapshot errors
+        }
+
+        // 3) Update baseline for dirty detection.
+        lastPersistedRef.current = {
+          noteId: activeSelectedNote.id,
+          title: normalizeForCompare(nextTitle),
+          body: normalizeForCompare(trimmedBody),
+        };
+
+        setAutosaveStatus("saved");
+        setAutosaveMessage("Saved");
+        setLastAutosavedAt(now);
+      } catch (e) {
+        console.error("Autosave failed:", e);
+        setAutosaveStatus("error");
+        setAutosaveMessage("Autosave failed");
+      }
+    }, 900);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
+    // Intentionally depends on draft fields + selected note identity.
+  }, [title, body, view, activeSelectedNote, isHistoryOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // PUBLIC_INTERFACE
   function saveSelectedNote() {
@@ -632,6 +835,23 @@ function App() {
       updated.sort(sortNotesPinnedFirst);
       return updated;
     });
+
+    // Keep version history aligned with explicit saves too.
+    try {
+      addNoteSnapshot({ id: activeSelectedNote.id, title: nextTitle, body: trimmedBody });
+      setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+    } catch {
+      // ignore
+    }
+
+    lastPersistedRef.current = {
+      noteId: activeSelectedNote.id,
+      title: normalizeForCompare(nextTitle),
+      body: normalizeForCompare(trimmedBody),
+    };
+    setAutosaveStatus("saved");
+    setAutosaveMessage("Saved");
+    setLastAutosavedAt(now);
   }
 
   // PUBLIC_INTERFACE
@@ -677,6 +897,9 @@ function App() {
         (a, b) => (b.deletedAt || 0) - (a.deletedAt || 0)
       );
     });
+
+    // Close history panel when note is no longer editable.
+    setIsHistoryOpen(false);
   }
 
   // PUBLIC_INTERFACE
@@ -1163,6 +1386,20 @@ function App() {
     }
   }
 
+  function autosaveLabel() {
+    if (view !== "notes") return "";
+    if (!activeSelectedNote) return "";
+
+    if (autosaveStatus === "saving") return "Autosave: saving…";
+    if (autosaveStatus === "unsaved") return "Autosave: unsaved changes";
+    if (autosaveStatus === "error") return "Autosave: error";
+    if (autosaveStatus === "saved") {
+      if (lastAutosavedAt) return `Autosave: saved • ${formatDate(lastAutosavedAt)}`;
+      return "Autosave: saved";
+    }
+    return "";
+  }
+
   const emptyState = notes.length === 0;
   const emptyTrashState = trashedNotes.length === 0;
 
@@ -1237,38 +1474,51 @@ function App() {
         run: () => setEditorMode((m) => (m === "edit" ? "preview" : "edit")),
       },
       {
-        id: "restore",
-        label: "Restore selected note",
-        hint: "R",
-        keywords: ["trash", "restore", "undelete"],
-        disabled: view !== "trash" || !hasSelectedTrash,
+        id: "toggle-history",
+        label: isHistoryOpen ? "History: Hide versions" : "History: Show versions",
+        hint: "Toggle",
+        keywords: ["history", "versions", "snapshot", "restore"],
+        disabled: view !== "notes" || !hasSelectedNote,
         disabledReason:
-          view !== "trash"
-            ? "Only available in Trash"
-            : !hasSelectedTrash
-              ? "No trashed note selected"
-              : "",
-        run: () => restoreSelectedNoteFromTrash(),
-      },
-      {
-        id: "delete",
-        label: view === "trash" ? "Delete selected forever" : "Move selected to Trash",
-        hint: "Del",
-        keywords: ["remove", "delete"],
-        disabled:
-          (view === "trash" && !hasSelectedTrash) || (view === "notes" && !hasSelectedNote),
-        disabledReason:
-          view === "trash"
-            ? !hasSelectedTrash
-              ? "No trashed note selected"
-              : ""
+          view !== "notes"
+            ? "Only available in Notes"
             : !hasSelectedNote
               ? "No note selected"
               : "",
-        run: () =>
-          view === "trash"
-            ? permanentlyDeleteSelectedTrashNote()
-            : moveSelectedNoteToTrash(),
+        run: () => {
+          if (view !== "notes" || !activeSelectedNote) return;
+          setIsHistoryOpen((v) => !v);
+          setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+        },
+      },
+      {
+        id: "restore-latest-snapshot",
+        label: "History: Restore latest snapshot",
+        hint: "Restore",
+        keywords: ["history", "restore", "undo"],
+        disabled: view !== "notes" || !hasSelectedNote || getNoteSnapshots(activeSelectedNote?.id).length === 0,
+        disabledReason:
+          view !== "notes"
+            ? "Only available in Notes"
+            : !hasSelectedNote
+              ? "No note selected"
+              : getNoteSnapshots(activeSelectedNote?.id).length === 0
+                ? "No snapshots yet"
+                : "",
+        run: () => {
+          if (view !== "notes" || !activeSelectedNote) return;
+          const snaps = getNoteSnapshots(activeSelectedNote.id);
+          const latest = snaps[0];
+          if (!latest) return;
+
+          const ok = window.confirm("Restore the latest snapshot? Current draft will be replaced.");
+          if (!ok) return;
+
+          setTitle(latest.title);
+          setBody(latest.body);
+          setAutosaveStatus("unsaved");
+          setAutosaveMessage("Restored snapshot (not saved yet)");
+        },
       },
     ];
   }, [
@@ -1279,6 +1529,7 @@ function App() {
     theme,
     activeSelectedNote,
     trashSelectedNote,
+    isHistoryOpen,
     // actions + refs
     createNewNote,
     exportNotesToJson,
@@ -1607,6 +1858,14 @@ function App() {
                     <strong className="retro-status__strong">
                       {selectedNote.title || "Untitled"}
                     </strong>
+                    {view === "notes" && activeSelectedNote ? (
+                      <span className="retro-autosave" aria-live="polite">
+                        {" "}
+                        • <span className={`retro-autosave__pill is-${autosaveStatus}`}>
+                          {autosaveLabel()}
+                        </span>
+                      </span>
+                    ) : null}
                   </>
                 ) : view === "trash" ? (
                   emptyTrashState ? (
@@ -1625,6 +1884,22 @@ function App() {
             <div className="retro-toolbar__right">
               {view === "notes" ? (
                 <>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      if (!activeSelectedNote) return;
+                      setIsHistoryOpen((v) => {
+                        const next = !v;
+                        if (next) setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+                        return next;
+                      });
+                    }}
+                    disabled={!activeSelectedNote}
+                    title="Show version history"
+                  >
+                    History
+                  </button>
+
                   {/* Reminders */}
                   <div className="retro-reminder" role="group" aria-label="Reminders">
                     {notificationsSupported() ? (
@@ -1676,11 +1951,9 @@ function App() {
                         const v = e.target.value;
                         if (!v) return;
                         const ms = new Date(v).getTime();
-                        // Store draft on note immediately? We set only on explicit "Set" for clarity.
-                        // (No-op here.)
                         if (!Number.isFinite(ms)) return;
                       }}
-                      onBlur={(e) => {
+                      onBlur={() => {
                         // No-op: we rely on Set button to schedule.
                       }}
                       aria-label="Reminder time"
@@ -1774,6 +2047,94 @@ function App() {
             </div>
           </div>
 
+          {view === "notes" && activeSelectedNote && isHistoryOpen ? (
+            <div className="retro-history" aria-label="Version history">
+              <div className="retro-history__head">
+                <div className="retro-history__title">Version history</div>
+                <div className="retro-history__actions">
+                  <button
+                    type="button"
+                    className="btn btn-small"
+                    onClick={() => {
+                      setHistoryItems(getNoteSnapshots(activeSelectedNote.id));
+                    }}
+                    title="Refresh snapshots"
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-small btn-danger"
+                    onClick={() => {
+                      const snaps = getNoteSnapshots(activeSelectedNote.id);
+                      if (snaps.length === 0) return;
+                      const ok = window.confirm(
+                        `Clear all ${snaps.length} snapshots for this note? This cannot be undone.`
+                      );
+                      if (!ok) return;
+                      clearNoteSnapshots(activeSelectedNote.id);
+                      setHistoryItems([]);
+                    }}
+                    disabled={historyItems.length === 0}
+                    title="Clear all snapshots"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-small"
+                    onClick={() => setIsHistoryOpen(false)}
+                    title="Close history"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              {historyItems.length === 0 ? (
+                <div className="retro-history__empty">
+                  No snapshots yet. They are created automatically on autosave and manual save.
+                </div>
+              ) : (
+                <div className="retro-history__list" role="list">
+                  {historyItems.slice(0, 12).map((s) => {
+                    const preview =
+                      (s.body || "").replace(/\s+/g, " ").trim().slice(0, 90) || "…";
+                    return (
+                      <div key={s.id} className="retro-history__item" role="listitem">
+                        <div className="retro-history__meta">
+                          <div className="retro-history__when">{formatDate(s.createdAt)}</div>
+                          <div className="retro-history__label">{s.title || "Untitled"}</div>
+                          <div className="retro-history__preview">{preview}</div>
+                        </div>
+                        <div className="retro-history__btns">
+                          <button
+                            type="button"
+                            className="btn btn-small"
+                            onClick={() => {
+                              const ok = window.confirm(
+                                "Restore this snapshot? Current draft will be replaced."
+                              );
+                              if (!ok) return;
+
+                              setTitle(s.title);
+                              setBody(s.body);
+                              setAutosaveStatus("unsaved");
+                              setAutosaveMessage("Restored snapshot (not saved yet)");
+                            }}
+                            title="Restore snapshot (replaces current draft)"
+                          >
+                            Restore
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          ) : null}
+
           {error ? (
             <div className="retro-alert" role="alert">
               {error}
@@ -1818,7 +2179,9 @@ function App() {
                       <button
                         type="button"
                         role="tab"
-                        className={`btn btn-small ${editorMode === "preview" ? "btn-primary" : ""}`}
+                        className={`btn btn-small ${
+                          editorMode === "preview" ? "btn-primary" : ""
+                        }`}
                         aria-selected={editorMode === "preview" ? "true" : "false"}
                         aria-pressed={editorMode === "preview" ? "true" : "false"}
                         onClick={() => setEditorMode("preview")}
@@ -1855,7 +2218,15 @@ function App() {
                           // - Drop any parsed HTML nodes if present (defense-in-depth)
                           // - Sanitize/validate URLs for links/images
                           skipHtml={true}
-                          disallowedElements={["script", "style", "iframe", "object", "embed", "link", "meta"]}
+                          disallowedElements={[
+                            "script",
+                            "style",
+                            "iframe",
+                            "object",
+                            "embed",
+                            "link",
+                            "meta",
+                          ]}
                           unwrapDisallowed={true}
                           urlTransform={(url) => (isSafeUrl(url) ? url : "")}
                           components={{
@@ -1951,8 +2322,10 @@ function App() {
 
                 <div className="retro-footer">
                   <div className="retro-hint">
-                    Tip: Use <kbd>Save</kbd> after edits. Notes are stored in this browser
-                    (localStorage).
+                    Tip: Changes autosave. Notes are stored in this browser (localStorage).{" "}
+                    <span className="retro-hint__soft">
+                      You can still use <kbd>Save</kbd> for an explicit save point.
+                    </span>
                   </div>
                   <div className="retro-timestamps">
                     <span>

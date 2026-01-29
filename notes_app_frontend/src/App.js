@@ -16,6 +16,10 @@ const TRASH_STORAGE_KEY = "retro_notes_trash_v1";
 const SORT_MODE_KEY = "retro_notes_sort_mode_v1";
 const EXPORT_SCHEMA_VERSION = 2;
 
+const THEME_KEY = "retro_notes_theme_v1";
+
+/** @typedef {"retro"|"light"} Theme */
+
 /**
  * @typedef {Object} Note
  * @property {string} id
@@ -201,8 +205,24 @@ function shouldIgnoreGlobalShortcut(e) {
   return false;
 }
 
+/**
+ * Safely read theme from localStorage.
+ * Defaults to "retro" (the current look) for backwards compatibility.
+ */
+function readStoredTheme() {
+  try {
+    const raw = localStorage.getItem(THEME_KEY);
+    return raw === "light" || raw === "retro" ? raw : "retro";
+  } catch {
+    return "retro";
+  }
+}
+
 // PUBLIC_INTERFACE
 function App() {
+  /** @type {[Theme, Function]} */
+  const [theme, setTheme] = useState(() => readStoredTheme());
+
   /** @type {[Note[], Function]} */
   const [notes, setNotes] = useState([]);
   /** @type {[Note[], Function]} */
@@ -235,6 +255,25 @@ function App() {
 
   // Keyboard shortcut focus targets.
   const searchInputRef = useRef(null);
+
+  // Persist theme preference.
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch (e) {
+      // Non-fatal: theme preference just won't persist.
+      console.warn("Failed to persist theme:", e);
+    }
+  }, [theme]);
+
+  // Update browser meta theme-color for nicer mobile UI.
+  useEffect(() => {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+
+    // Keep this in sync with App theme backgrounds.
+    meta.setAttribute("content", theme === "light" ? "#f8fafc" : "#070812");
+  }, [theme]);
 
   // Load from localStorage once.
   useEffect(() => {
@@ -415,6 +454,12 @@ function App() {
     });
     // In trash view, tag filter isn't applicable; keep it but it won't apply.
   }, [view, notes, trashedNotes]);
+
+  // PUBLIC_INTERFACE
+  function toggleTheme() {
+    /** Toggle between Retro neon and Light theme (persisted). */
+    setTheme((t) => (t === "light" ? "retro" : "light"));
+  }
 
   // PUBLIC_INTERFACE
   function createNewNote() {
@@ -805,6 +850,7 @@ function App() {
    * - Ctrl/Cmd + K or / : Focus search
    * - Ctrl/Cmd + 1: Notes view
    * - Ctrl/Cmd + 2: Trash view
+   * - Ctrl/Cmd + P: Toggle Markdown preview (Notes view)
    * - Delete / Backspace (when not typing): Move selected note to trash (Notes) / delete forever (Trash)
    * - R (Trash): Restore selected note
    * - Esc (global): Clear search if not already handled by focused input; otherwise do nothing.
@@ -827,10 +873,7 @@ function App() {
       }
 
       // Focus search: Ctrl/Cmd+K is common; also support "/" when not typing.
-      if (
-        ((metaOrCtrl && lower === "k") || (!metaOrCtrl && lower === "/")) &&
-        !ignore
-      ) {
+      if (((metaOrCtrl && lower === "k") || (!metaOrCtrl && lower === "/")) && !ignore) {
         e.preventDefault();
         setTimeout(() => {
           searchInputRef.current?.focus();
@@ -923,7 +966,7 @@ function App() {
   const emptyTrashState = trashedNotes.length === 0;
 
   return (
-    <div className="App" data-retro="true">
+    <div className="App" data-retro="true" data-theme={theme}>
       <div className="retro-bg" aria-hidden="true" />
       <header className="retro-header">
         <div className="retro-header__left">
@@ -952,6 +995,21 @@ function App() {
               importNotesFromJsonFile(f);
             }}
           />
+
+          <div className="retro-theme-toggle" role="group" aria-label="Theme">
+            <span className="retro-theme-toggle__label" aria-hidden="true">
+              Theme
+            </span>
+            <button
+              type="button"
+              className="btn btn-small retro-theme-toggle__btn"
+              onClick={toggleTheme}
+              aria-pressed={theme === "light" ? "true" : "false"}
+              title={theme === "light" ? "Switch to Retro neon" : "Switch to Light"}
+            >
+              {theme === "light" ? "Light" : "Retro"}
+            </button>
+          </div>
 
           <div className="retro-viewtoggle" role="group" aria-label="Notes view">
             <button
@@ -1317,11 +1375,7 @@ function App() {
                       Note
                     </label>
 
-                    <div
-                      className="retro-segtoggle"
-                      role="tablist"
-                      aria-label="Editor mode"
-                    >
+                    <div className="retro-segtoggle" role="tablist" aria-label="Editor mode">
                       <button
                         type="button"
                         role="tab"

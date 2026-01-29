@@ -16,3 +16,10 @@ body {
 * {
   box-sizing: border-box;
 }
+
+/* If the app is set to light theme, make sure the page background also matches.
+   (App sets data-theme on its root element.) */
+.App[data-theme="light"] ~ #root,
+#root:has(.App[data-theme="light"]) {
+  background: #f8fafc;
+}

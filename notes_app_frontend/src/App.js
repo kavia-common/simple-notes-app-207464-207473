@@ -216,6 +216,10 @@ function App() {
   const [body, setBody] = useState("");
   const [query, setQuery] = useState("");
 
+  /** @typedef {"edit"|"preview"} EditorMode */
+  /** @type {[EditorMode, Function]} */
+  const [editorMode, setEditorMode] = useState("edit");
+
   /** @type {[SortMode, Function]} */
   const [sortMode, setSortMode] = useState("updated_desc");
 
@@ -369,6 +373,10 @@ function App() {
   // Keep editor fields in sync with selected note (only for Notes view).
   useEffect(() => {
     setError("");
+
+    // Reset to Edit mode when the selected note changes / view changes.
+    // This preserves the "type and save" workflow and avoids landing in Preview unexpectedly.
+    setEditorMode("edit");
 
     if (view === "trash") {
       setTitle("");
@@ -838,6 +846,15 @@ function App() {
         return;
       }
 
+      // Toggle Markdown Edit/Preview in Notes view
+      if (metaOrCtrl && lower === "p" && !ignore) {
+        if (view !== "notes") return;
+        if (!activeSelectedNote) return;
+        e.preventDefault();
+        setEditorMode((m) => (m === "edit" ? "preview" : "edit"));
+        return;
+      }
+
       // Delete shortcut when NOT typing
       if ((key === "Delete" || key === "Backspace") && !ignore) {
         // In Notes: delete -> move to trash
@@ -1295,43 +1312,76 @@ function App() {
                 </div>
 
                 <div className="retro-field">
-                  <label className="retro-label" htmlFor="body">
-                    Note
-                  </label>
-                  <textarea
-                    id="body"
-                    className="retro-textarea"
-                    value={body}
-                    onChange={(e) => setBody(e.target.value)}
-                    placeholder="Write something…"
-                    rows={12}
-                  />
+                  <div className="retro-labelrow">
+                    <label className="retro-label" htmlFor="body">
+                      Note
+                    </label>
 
-                  <div className="retro-md-preview-wrap" aria-label="Markdown preview">
-                    <div className="retro-md-preview__label">
-                      Preview (Markdown)
-                    </div>
-
-                    <div className="retro-readonly retro-md-preview" data-hotkeys="off">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        // Keep Markdown rendering strictly "preview-only" and safe:
-                        // - no raw HTML rendering (default behavior)
-                        // - open links safely
-                        components={{
-                          a: ({ node, ...props }) => (
-                            <a
-                              {...props}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            />
-                          ),
-                        }}
+                    <div
+                      className="retro-segtoggle"
+                      role="tablist"
+                      aria-label="Editor mode"
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        className={`btn btn-small ${editorMode === "edit" ? "btn-primary" : ""}`}
+                        aria-selected={editorMode === "edit" ? "true" : "false"}
+                        aria-pressed={editorMode === "edit" ? "true" : "false"}
+                        onClick={() => setEditorMode("edit")}
+                        title="Edit note"
                       >
-                        {body && body.trim() ? body : "_Nothing to preview yet._"}
-                      </ReactMarkdown>
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        className={`btn btn-small ${editorMode === "preview" ? "btn-primary" : ""}`}
+                        aria-selected={editorMode === "preview" ? "true" : "false"}
+                        aria-pressed={editorMode === "preview" ? "true" : "false"}
+                        onClick={() => setEditorMode("preview")}
+                        title="Preview Markdown"
+                      >
+                        Preview
+                      </button>
                     </div>
                   </div>
+
+                  {editorMode === "edit" ? (
+                    <textarea
+                      id="body"
+                      className="retro-textarea"
+                      value={body}
+                      onChange={(e) => setBody(e.target.value)}
+                      placeholder="Write something…"
+                      rows={12}
+                    />
+                  ) : (
+                    <div className="retro-md-preview-wrap" aria-label="Markdown preview">
+                      <div className="retro-md-preview__label">
+                        Preview (Markdown)
+                        <span className="retro-md-preview__hint">
+                          • <kbd>Ctrl/⌘</kbd>+<kbd>P</kbd> toggle
+                        </span>
+                      </div>
+
+                      <div className="retro-readonly retro-md-preview" data-hotkeys="off">
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          // Keep Markdown rendering strictly "preview-only" and safe:
+                          // - no raw HTML rendering (default behavior)
+                          // - open links safely
+                          components={{
+                            a: ({ node, ...props }) => (
+                              <a {...props} target="_blank" rel="noopener noreferrer" />
+                            ),
+                          }}
+                        >
+                          {body && body.trim() ? body : "_Nothing to preview yet._"}
+                        </ReactMarkdown>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="retro-field">
@@ -1506,7 +1556,7 @@ function App() {
               </>
             ) : (
               <>
-                <kbd>Del</kbd> trash
+                <kbd>Ctrl/⌘</kbd>+<kbd>P</kbd> preview • <kbd>Del</kbd> trash
               </>
             )}
           </span>

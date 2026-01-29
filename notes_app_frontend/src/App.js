@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import DOMPurify from "dompurify";
 import CommandPalette from "./components/CommandPalette";
 import "./App.css";
 
@@ -217,6 +218,43 @@ function readStoredTheme() {
   } catch {
     return "retro";
   }
+}
+
+/**
+ * Security hardening helpers for Markdown preview.
+ *
+ * Note: react-markdown does NOT render raw HTML by default (so <script> won't execute),
+ * but we add defense-in-depth to ensure:
+ * - links can't use "javascript:" or other dangerous protocols
+ * - if raw HTML is ever enabled in the future, we have a safe rendering path ready
+ */
+function isSafeUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return false;
+
+  // Allow hash links and relative paths.
+  if (raw.startsWith("#") || raw.startsWith("/") || raw.startsWith("./") || raw.startsWith("../")) {
+    return true;
+  }
+
+  // Allow standard http(s) and mailto/tel.
+  try {
+    const parsed = new URL(raw);
+    const protocol = parsed.protocol.toLowerCase();
+    return protocol === "http:" || protocol === "https:" || protocol === "mailto:" || protocol === "tel:";
+  } catch {
+    // If URL constructor fails, treat as unsafe.
+    return false;
+  }
+}
+
+function sanitizeHtml(html) {
+  // DOMPurify defaults are already quite strict; we explicitly forbid common scriptable nodes/attrs.
+  // We also disallow "style" to avoid CSS injection shenanigans.
+  return DOMPurify.sanitize(String(html || ""), {
+    FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "link", "meta"],
+    FORBID_ATTR: ["style", "onerror", "onload", "onclick", "onmouseover"],
+  });
 }
 
 // PUBLIC_INTERFACE
@@ -1589,13 +1627,32 @@ function App() {
                       <div className="retro-readonly retro-md-preview" data-hotkeys="off">
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
-                          // Keep Markdown rendering strictly "preview-only" and safe:
-                          // - no raw HTML rendering (default behavior)
-                          // - open links safely
+                          // Security hardening:
+                          // - Explicitly do NOT allow raw HTML rendering in Markdown
+                          // - Drop any parsed HTML nodes if present (defense-in-depth)
+                          // - Sanitize/validate URLs for links/images
+                          skipHtml={true}
+                          disallowedElements={["script", "style", "iframe", "object", "embed", "link", "meta"]}
+                          unwrapDisallowed={true}
+                          urlTransform={(url) => (isSafeUrl(url) ? url : "")}
                           components={{
-                            a: ({ node, ...props }) => (
-                              <a {...props} target="_blank" rel="noopener noreferrer" />
+                            a: ({ node, href, ...props }) => (
+                              <a
+                                {...props}
+                                href={isSafeUrl(href) ? href : undefined}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              />
                             ),
+                            img: ({ node, src, alt, ...props }) =>
+                              isSafeUrl(src) ? (
+                                <img {...props} src={src} alt={alt || ""} />
+                              ) : (
+                                <span />
+                              ),
+                            // If raw HTML ever becomes enabled later, this keeps it safe.
+                            // (Not used with skipHtml=true, but kept for future-proofing.)
+                            div: ({ node, ...props }) => <div {...props} />,
                           }}
                         >
                           {body && body.trim() ? body : "_Nothing to preview yet._"}

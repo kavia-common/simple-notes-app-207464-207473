@@ -90,6 +90,9 @@ function App() {
     });
   }, [notes, query]);
 
+  const resultsCount = filteredNotes.length;
+  const totalCount = notes.length;
+
   // Keep editor fields in sync with selected note.
   useEffect(() => {
     setError("");
@@ -223,13 +226,35 @@ function App() {
             <label className="retro-label" htmlFor="search">
               Search
             </label>
-            <input
-              id="search"
-              className="retro-input"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Type to filter…"
-            />
+
+            <div className="retro-search">
+              <input
+                id="search"
+                className="retro-input retro-search__input"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setQuery("");
+                }}
+                placeholder="Type to filter…"
+                aria-describedby="search-help"
+              />
+              <button
+                type="button"
+                className="btn retro-search__clear"
+                onClick={() => setQuery("")}
+                disabled={!query.trim()}
+                title="Clear search"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div id="search-help" className="retro-search__meta" aria-live="polite">
+              {query.trim()
+                ? `Showing ${resultsCount} of ${totalCount}`
+                : `Showing all ${totalCount}`}
+            </div>
           </div>
 
           <div className="retro-list" role="list">
@@ -394,7 +419,10 @@ function App() {
         <div className="retro-footerbar__left">
           <span className="retro-pip" aria-hidden="true" />
           <span>
-            Notes: <strong>{notes.length}</strong>
+            Notes:{" "}
+            <strong>
+              {query.trim() ? `${resultsCount} / ${totalCount}` : totalCount}
+            </strong>
           </span>
         </div>
         <div className="retro-footerbar__right">
